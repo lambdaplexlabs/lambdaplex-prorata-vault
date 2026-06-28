@@ -9,6 +9,8 @@ import "../libraries/PRBMathCommon.sol";
 import "../libraries/SafeERC20.sol";
 import "../interfaces/IAirdropDistributor.sol";
 import "../interfaces/IERC20.sol";
+import "../interfaces/AMM/ISaucerV1Router.sol";
+import "../interfaces/AMM/ISaucerV2Router.sol";
 
 /* ─────────────────────────── Utilities ─────────────────────────── */
 
@@ -192,6 +194,29 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
         uint256 sharesBurned,
         uint256 baseOut,
         uint256 quoteOut
+    );
+
+    /* ───────────────────────── SaucerSwap rebalance config ───────────────────────── */
+
+    // SaucerSwap mainnet addresses
+    address public constant WHBAR =
+        0x0000000000000000000000000000000000163B59;
+    address public constant SAUCER_V1_FACTORY =
+        0x0000000000000000000000000000000000103780;
+    address public constant SAUCER_V1_ROUTER =
+        0x00000000000000000000000000000000002E7A5D;
+    address public constant SAUCER_V2_FACTORY =
+        0x00000000000000000000000000000000003c3951;
+    address public constant SAUCER_V2_ROUTER =
+        0x00000000000000000000000000000000003c437A;
+    event ManagerRebalance(
+        uint8 indexed ammVersion, // 1 = Saucer V1, 2 = Saucer V2
+        bool indexed baseToQuote,
+        address indexed tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 amountOutMin,
+        uint256 amountOutActual
     );
 
     /* ───────────────────────── Constructor ───────────────────────── */
@@ -1281,4 +1306,292 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
     }
 
     receive() external payable {}
+
+    //-------------------- AMM Rebalances ---------------------
+
+   function _ammToken(address vaultToken) internal pure returns (address) {
+        return vaultToken == address(0) ? WHBAR : vaultToken;
+    }
+
+    function _tokensForDirection(bool baseToQuote)
+        internal
+        view
+        returns (address tokenIn, address tokenOut)
+    {
+        tokenIn = baseToQuote ? BASE : QUOTE;
+        tokenOut = baseToQuote ? QUOTE : BASE;
+        require(tokenIn != tokenOut, "same token");
+    }
+
+    function _safeApprove(
+        address token,
+        address spender,
+        uint256 amount
+    ) internal {
+        (bool success, bytes memory ret) = token.call(
+            abi.encodeWithSelector(IERC20.approve.selector, spender, amount)
+        );
+
+        require(success, "APPROVE_CALL_FAILED");
+
+        if (ret.length > 0) {
+            require(abi.decode(ret, (bool)), "APPROVE_FAILED");
+        }
+    }
+
+    function _checkSwapInputs(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        uint256 deadline
+    ) internal view {
+        require(!emergencyMode, "emergency: swaps disabled");
+        require(initialized, "not initialized");
+        require(block.timestamp <= deadline, "expired");
+        require(amountIn > 0, "amountIn=0");
+        require(amountOutMin > 0, "amountOutMin=0");
+    }
+
+    function _checkV1Path(
+        bool baseToQuote,
+        address[] calldata path
+    ) internal view returns (address tokenIn, address tokenOut) {
+        require(path.length >= 2, "bad path");
+
+        (tokenIn, tokenOut) = _tokensForDirection(baseToQuote);
+
+        require(path[0] == _ammToken(tokenIn), "bad tokenIn");
+        require(path[path.length - 1] == _ammToken(tokenOut), "bad tokenOut");
+    }
+
+    function _readV2Token(bytes calldata path, uint256 offset)
+        internal
+        pure
+        returns (address token)
+    {
+        require(path.length >= offset + 20, "path oob");
+
+        assembly {
+            token := shr(96, calldataload(add(path.offset, offset)))
+        }
+    }
+
+    function _checkV2Path(
+        bool baseToQuote,
+        bytes calldata path
+    ) internal view returns (address tokenIn, address tokenOut) {
+        // tokenA(20) + fee(3) + tokenB(20)
+        require(path.length >= 43, "bad path");
+        require((path.length - 20) % 23 == 0, "bad path len");
+
+        (tokenIn, tokenOut) = _tokensForDirection(baseToQuote);
+
+        address first = _readV2Token(path, 0);
+        address last = _readV2Token(path, path.length - 20);
+
+        require(first == _ammToken(tokenIn), "bad tokenIn");
+        require(last == _ammToken(tokenOut), "bad tokenOut");
+    }
+
+    /// @notice Manager-only exact-input rebalance through SaucerSwap V1.
+    /// @dev Supports token->token, HBAR->token, token->HBAR, and multihop paths.
+    ///      If a vault side is HBAR, the route should use WHBAR as that endpoint.
+    function managerRebalanceSaucerV1(
+        bool baseToQuote,
+        uint256 amountIn,
+        uint256 amountOutMin,
+        uint256 deadline,
+        address[] calldata path
+    )
+        external
+        nonReentrant
+        onlyManagerOrOwner
+        returns (uint256 amountOutActual)
+    {
+        _checkSwapInputs(amountIn, amountOutMin, deadline);
+        
+        (address tokenIn, address tokenOut) = _checkV1Path(baseToQuote, path);
+
+        _accrueMgmtFee();
+
+        uint256 inBefore = _vaultBalance(tokenIn);
+        uint256 outBefore = _vaultBalance(tokenOut);
+
+        require(inBefore >= amountIn, "insufficient input");
+
+        if (tokenIn == address(0)) {
+            // HBAR -> token
+            ISaucerV1Router(SAUCER_V1_ROUTER).swapExactETHForTokens{
+                value: amountIn
+            }(
+                amountOutMin,
+                path,
+                address(this),
+                deadline
+            );
+        } else if (tokenOut == address(0)) {
+            // token -> HBAR
+            _safeApprove(tokenIn, SAUCER_V1_ROUTER, amountIn);
+
+            ISaucerV1Router(SAUCER_V1_ROUTER).swapExactTokensForETH(
+                amountIn,
+                amountOutMin,
+                path,
+                address(this),
+                deadline
+            );
+
+            _safeApprove(tokenIn, SAUCER_V1_ROUTER, 0);
+        } else {
+            // token -> token
+            _safeApprove(tokenIn, SAUCER_V1_ROUTER, amountIn);
+
+            ISaucerV1Router(SAUCER_V1_ROUTER).swapExactTokensForTokens(
+                amountIn,
+                amountOutMin,
+                path,
+                address(this),
+                deadline
+            );
+
+            _safeApprove(tokenIn, SAUCER_V1_ROUTER, 0);
+        }
+
+        uint256 inAfter = _vaultBalance(tokenIn);
+        uint256 outAfter = _vaultBalance(tokenOut);
+
+        require(inBefore >= inAfter, "input balance");
+        require(inBefore - inAfter == amountIn, "input spent");
+        require(outAfter >= outBefore, "output balance");
+
+        amountOutActual = outAfter - outBefore;
+        require(amountOutActual >= amountOutMin, "slippage");
+
+        emit ManagerRebalance(
+            1,
+            baseToQuote,
+            tokenIn,
+            tokenOut,
+            amountIn,
+            amountOutMin,
+            amountOutActual
+        );
+    }
+
+    /// @notice Manager-only exact-input rebalance through SaucerSwap V2.
+    /// @dev Supports token->token, HBAR->token, token->HBAR, and multihop paths.
+    ///      Path must be encoded as token|fee|token|fee|token.
+    ///      If a vault side is HBAR, the route should use WHBAR as that endpoint.
+    function managerRebalanceSaucerV2(
+        bool baseToQuote,
+        uint256 amountIn,
+        uint256 amountOutMin,
+        uint256 deadline,
+        bytes calldata path
+    )
+        external
+        nonReentrant
+        onlyManagerOrOwner
+        returns (uint256 amountOutActual)
+    {
+        _checkSwapInputs(amountIn, amountOutMin, deadline);
+
+        (address tokenIn, address tokenOut) = _checkV2Path(baseToQuote, path);
+
+        _accrueMgmtFee();
+
+        uint256 inBefore = _vaultBalance(tokenIn);
+        uint256 outBefore = _vaultBalance(tokenOut);
+
+        require(inBefore >= amountIn, "insufficient input");
+
+        uint256 callValue = 0;
+
+        if (tokenIn == address(0)) {
+            // HBAR -> token.
+            // The V2 path should start with WHBAR.
+            callValue = amountIn;
+        } else {
+            _safeApprove(tokenIn, SAUCER_V2_ROUTER, amountIn);
+        }
+
+        address recipient = tokenOut == address(0)
+            ? SAUCER_V2_ROUTER
+            : address(this);
+
+        bytes memory exactInputCall = abi.encodeWithSelector(
+            ISaucerV2Router.exactInput.selector,
+            ISaucerV2Router.ExactInputParams({
+                path: path,
+                recipient: recipient,
+                deadline: deadline,
+                amountIn: amountIn,
+                amountOutMinimum: amountOutMin
+            })
+        );
+
+        if (tokenOut == address(0)) {
+            // token -> HBAR
+            //
+            // exactInput sends WHBAR to the router.
+            // unwrapWHBAR unwraps it and sends native HBAR to this vault.
+            bytes[] memory calls = new bytes[](2);
+
+            calls[0] = exactInputCall;
+            calls[1] = abi.encodeWithSelector(
+                ISaucerV2Router.unwrapWHBAR.selector,
+                amountOutMin,
+                address(this)
+            );
+
+            ISaucerV2Router(SAUCER_V2_ROUTER).multicall(calls);
+        } else if (tokenIn == address(0)) {
+            // HBAR -> token
+            //
+            // The router receives native HBAR and handles wrapping internally.
+            // refundETH is included defensively.
+            bytes[] memory calls = new bytes[](2);
+
+            calls[0] = exactInputCall;
+            calls[1] = abi.encodeWithSelector(
+                ISaucerV2Router.refundETH.selector
+            );
+
+            ISaucerV2Router(SAUCER_V2_ROUTER).multicall{value: callValue}(calls);
+        } else {
+            // token -> token
+            ISaucerV2Router(SAUCER_V2_ROUTER).exactInput(
+                ISaucerV2Router.ExactInputParams({
+                    path: path,
+                    recipient: address(this),
+                    deadline: deadline,
+                    amountIn: amountIn,
+                    amountOutMinimum: amountOutMin
+                })
+            );
+        }
+
+        if (tokenIn != address(0)) {
+            _safeApprove(tokenIn, SAUCER_V2_ROUTER, 0);
+        }
+
+        uint256 inAfter = _vaultBalance(tokenIn);
+        uint256 outAfter = _vaultBalance(tokenOut);
+
+        require(inBefore >= inAfter, "input balance");
+        require(inBefore - inAfter == amountIn, "input spent");
+        require(outAfter >= outBefore, "output balance");
+
+        amountOutActual = outAfter - outBefore;
+        require(amountOutActual >= amountOutMin, "slippage");
+
+        emit ManagerRebalance(
+            2,
+            baseToQuote,
+            tokenIn,
+            tokenOut,
+            amountIn,
+            amountOutMin,
+            amountOutActual
+        );
+    }
 }
