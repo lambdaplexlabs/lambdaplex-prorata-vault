@@ -4875,4 +4875,788 @@ describe("Vault", () => {
       expect(lotAfter.shares).to.equal(lot.shares.sub(sharesToBurn));
     });
   });
+  // ─────────────────────────────────────────────────────────────
+  // Manager rebalance: SaucerSwap V1
+  // ─────────────────────────────────────────────────────────────
+  describe("manager rebalance: SaucerSwap V1", () => {
+
+    const WHBAR = "0x0000000000000000000000000000000000163b59";
+    const SAUCER_V1_ROUTER = "0x00000000000000000000000000000000002e7a5d";
+
+    let mockV1Router: any;
+
+    async function futureDeadline(seconds = 3600): Promise<number> {
+      const latest = await ethers.provider.getBlock("latest");
+      return latest!.timestamp + seconds;
+    }
+
+    async function pinMockV1Router() {
+      const RouterMock = await ethers.getContractFactory("MockSaucerV1Router");
+      const impl = await RouterMock.deploy();
+      await impl.deployed();
+
+      const runtime = await ethers.provider.getCode(impl.address);
+
+      await network.provider.send("hardhat_setCode", [
+        SAUCER_V1_ROUTER,
+        runtime,
+      ]);
+
+      const router = await ethers.getContractAt(
+        "MockSaucerV1Router",
+        SAUCER_V1_ROUTER
+      );
+
+      await router.setAmountOut(0);
+
+      return router;
+    }
+
+    async function initializeTokenTokenVault(
+      v = vault,
+      receiver?: string,
+      amount: BigNumber = ONE.mul(1_000)
+    ) {
+      const receiverAddr = receiver ?? (await deployer.getAddress());
+
+      await token0.connect(deployer).approve(v.address, amount);
+      await token1.connect(deployer).approve(v.address, amount);
+
+      await v.connect(deployer).initialize(
+        amount,
+        amount,
+        0,
+        receiverAddr,
+        await futureDeadline()
+      );
+
+      expect(await v.initialized()).to.equal(true);
+    }
+
+    async function deployProRataVault(base: string, quote: string) {
+      const Vault = await ethers.getContractFactory("PLEXProRataVault");
+
+      const v = (await Vault.deploy(
+        base,
+        quote,
+        distributor.address,
+        await deployer.getAddress(), // manager
+        0,                           // ownerFeeBips
+        WEEK_SECS,
+        DAY_SECS,
+        WEEK_SECS
+      )) as PLEXProRataVault;
+
+      await v.deployed();
+      return v;
+    }
+
+    async function initializeHbarBaseVault(v: PLEXProRataVault) {
+      const initBase = ONE.mul(1_000);  // HBAR side
+      const initQuote = ONE.mul(1_000); // token1 side
+
+      await token1.connect(deployer).approve(v.address, initQuote);
+
+      await v.connect(deployer).initialize(
+        initBase,
+        initQuote,
+        0,
+        await deployer.getAddress(),
+        await futureDeadline(),
+        { value: initBase }
+      );
+
+      expect(await v.initialized()).to.equal(true);
+    }
+
+    async function initializeHbarQuoteVault(v: PLEXProRataVault) {
+      const initBase = ONE.mul(1_000);  // token0 side
+      const initQuote = ONE.mul(1_000); // HBAR side
+
+      await token0.connect(deployer).approve(v.address, initBase);
+
+      await v.connect(deployer).initialize(
+        initBase,
+        initQuote,
+        0,
+        await deployer.getAddress(),
+        await futureDeadline(),
+        { value: initQuote }
+      );
+
+      expect(await v.initialized()).to.equal(true);
+    }
+
+    beforeEach(async () => {
+      mockV1Router = await pinMockV1Router();
+    });
+
+    it("only manager can call", async () => {
+      const amountIn = ONE.mul(10);
+      const amountOutMin = ONE.mul(5);
+
+      const path = [token0.address, token1.address];
+
+      await expect(
+        vault.connect(alice).managerRebalanceSaucerV1(
+          true,
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          path
+        )
+      ).to.be.revertedWith("not manager/owner");
+    });
+
+    it("reverts in emergency mode", async () => {
+      await initializeTokenTokenVault();
+
+      await vault.enableEmergencyMode();
+
+      const amountIn = ONE.mul(10);
+      const amountOutMin = ONE.mul(5);
+
+      const path = [token0.address, token1.address];
+
+      await expect(
+        vault.connect(deployer).managerRebalanceSaucerV1(
+          true,
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          path
+        )
+      ).to.be.revertedWith("emergency: swaps disabled");
+    });
+
+    it("bad tokenIn path reverts", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(10);
+      const amountOutMin = ONE.mul(5);
+
+      // baseToQuote=true means tokenIn must be BASE/token0.
+      const badPath = [token1.address, token0.address];
+
+      await expect(
+        vault.connect(deployer).managerRebalanceSaucerV1(
+          true,
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          badPath
+        )
+      ).to.be.revertedWith("bad tokenIn");
+    });
+
+    it("bad tokenOut path reverts", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(10);
+      const amountOutMin = ONE.mul(5);
+
+      // baseToQuote=true means tokenOut must be QUOTE/token1.
+      const badPath = [token0.address, token0.address];
+
+      await expect(
+        vault.connect(deployer).managerRebalanceSaucerV1(
+          true,
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          badPath
+        )
+      ).to.be.revertedWith("bad tokenOut");
+    });
+
+    it("token -> token rebalance succeeds", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(100);     // token0 in
+      const amountOutMin = ONE.mul(50);  // token1 out
+
+      const path = [token0.address, token1.address];
+
+      // Fund the hardcoded router with output token.
+      await token1.transfer(SAUCER_V1_ROUTER, amountOutMin);
+
+      const vaultBaseBefore = await token0.balanceOf(vault.address);
+      const vaultQuoteBefore = await token1.balanceOf(vault.address);
+      const routerBaseBefore = await token0.balanceOf(SAUCER_V1_ROUTER);
+
+      await expect(
+        vault.connect(deployer).managerRebalanceSaucerV1(
+          true, // BASE -> QUOTE
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          path
+        )
+      )
+        .to.emit(vault, "ManagerRebalance")
+        .withArgs(
+          1,
+          true,
+          token0.address,
+          token1.address,
+          amountIn,
+          amountOutMin,
+          amountOutMin
+        );
+
+      const vaultBaseAfter = await token0.balanceOf(vault.address);
+      const vaultQuoteAfter = await token1.balanceOf(vault.address);
+      const routerBaseAfter = await token0.balanceOf(SAUCER_V1_ROUTER);
+
+      expect(vaultBaseBefore.sub(vaultBaseAfter)).to.equal(amountIn);
+      expect(vaultQuoteAfter.sub(vaultQuoteBefore)).to.equal(amountOutMin);
+
+      // Router pulled exactly amountIn from the vault.
+      expect(routerBaseAfter.sub(routerBaseBefore)).to.equal(amountIn);
+    });
+
+    it("HBAR -> token rebalance succeeds", async () => {
+      const hbarVault = await deployProRataVault(
+        ethers.constants.AddressZero, // BASE = HBAR
+        token1.address                // QUOTE = token1
+      );
+
+      await initializeHbarBaseVault(hbarVault);
+
+      const amountIn = ONE.mul(100);     // HBAR in
+      const amountOutMin = ONE.mul(50);  // token1 out
+
+      const path = [WHBAR, token1.address];
+
+      // Fund router with output token.
+      await token1.transfer(SAUCER_V1_ROUTER, amountOutMin);
+
+      const hbarBefore = await ethers.provider.getBalance(hbarVault.address);
+      const quoteBefore = await token1.balanceOf(hbarVault.address);
+
+      await hbarVault.connect(deployer).managerRebalanceSaucerV1(
+        true, // BASE(HBAR) -> QUOTE(token1)
+        amountIn,
+        amountOutMin,
+        await futureDeadline(),
+        path
+      );
+
+      const hbarAfter = await ethers.provider.getBalance(hbarVault.address);
+      const quoteAfter = await token1.balanceOf(hbarVault.address);
+
+      expect(hbarBefore.sub(hbarAfter)).to.equal(amountIn);
+      expect(quoteAfter.sub(quoteBefore)).to.equal(amountOutMin);
+    });
+
+    it("token -> HBAR rebalance succeeds", async () => {
+      const hbarVault = await deployProRataVault(
+        token0.address,                // BASE = token0
+        ethers.constants.AddressZero   // QUOTE = HBAR
+      );
+
+      await initializeHbarQuoteVault(hbarVault);
+
+      const amountIn = ONE.mul(100);     // token0 in
+      const amountOutMin = ONE.mul(50);  // HBAR out
+
+      const path = [token0.address, WHBAR];
+
+      // Fund router with native HBAR so it can pay the vault.
+      await network.provider.send("hardhat_setBalance", [
+        SAUCER_V1_ROUTER,
+        amountOutMin.toHexString(),
+      ]);
+
+      const baseBefore = await token0.balanceOf(hbarVault.address);
+      const hbarBefore = await ethers.provider.getBalance(hbarVault.address);
+
+      await hbarVault.connect(deployer).managerRebalanceSaucerV1(
+        true, // BASE(token0) -> QUOTE(HBAR)
+        amountIn,
+        amountOutMin,
+        await futureDeadline(),
+        path
+      );
+
+      const baseAfter = await token0.balanceOf(hbarVault.address);
+      const hbarAfter = await ethers.provider.getBalance(hbarVault.address);
+
+      expect(baseBefore.sub(baseAfter)).to.equal(amountIn);
+      expect(hbarAfter.sub(hbarBefore)).to.equal(amountOutMin);
+    });
+
+    it("amountOutMin enforced", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(100);
+      const amountOutMin = ONE.mul(50);
+      const actualOut = amountOutMin.sub(1);
+
+      const path = [token0.address, token1.address];
+
+      await mockV1Router.setAmountOut(actualOut);
+
+      // Fund router enough that the only failure is slippage.
+      await token1.transfer(SAUCER_V1_ROUTER, amountOutMin);
+
+      await expect(
+        vault.connect(deployer).managerRebalanceSaucerV1(
+          true,
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          path
+        )
+      ).to.be.revertedWith("MockV1: slippage");
+    });
+
+    it("exact amountIn spent", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(123);
+      const amountOutMin = ONE.mul(77);
+
+      const path = [token0.address, token1.address];
+
+      await token1.transfer(SAUCER_V1_ROUTER, amountOutMin);
+
+      const vaultBaseBefore = await token0.balanceOf(vault.address);
+      const vaultQuoteBefore = await token1.balanceOf(vault.address);
+
+      const routerBaseBefore = await token0.balanceOf(SAUCER_V1_ROUTER);
+
+      await vault.connect(deployer).managerRebalanceSaucerV1(
+        true,
+        amountIn,
+        amountOutMin,
+        await futureDeadline(),
+        path
+      );
+
+      const vaultBaseAfter = await token0.balanceOf(vault.address);
+      const vaultQuoteAfter = await token1.balanceOf(vault.address);
+
+      const routerBaseAfter = await token0.balanceOf(SAUCER_V1_ROUTER);
+
+      expect(vaultBaseBefore.sub(vaultBaseAfter)).to.equal(amountIn);
+      expect(routerBaseAfter.sub(routerBaseBefore)).to.equal(amountIn);
+
+      expect(vaultQuoteAfter.sub(vaultQuoteBefore)).to.equal(amountOutMin);
+    });
+  });
+  // ─────────────────────────────────────────────────────────────
+  // Manager rebalance: SaucerSwap V2
+  // ─────────────────────────────────────────────────────────────
+  describe("manager rebalance: SaucerSwap V2", () => {
+    const ONE = BigNumber.from(10).pow(8);
+
+    const WHBAR = "0x0000000000000000000000000000000000163b59";
+    const SAUCER_V2_ROUTER = "0x00000000000000000000000000000000003c437a";
+
+    const FEE = 500; // arbitrary v2 fee tier for encoded mock path
+
+    let mockV2Router: any;
+
+    async function futureDeadline(seconds = 3600): Promise<number> {
+      const latest = await ethers.provider.getBlock("latest");
+      return latest!.timestamp + seconds;
+    }
+
+    function encodeV2Path(tokens: string[], fees: number[]): string {
+      if (tokens.length !== fees.length + 1) {
+        throw new Error("bad v2 path input");
+      }
+
+      const types: string[] = [];
+      const values: any[] = [];
+
+      for (let i = 0; i < fees.length; i++) {
+        types.push("address", "uint24");
+        values.push(tokens[i], fees[i]);
+      }
+
+      types.push("address");
+      values.push(tokens[tokens.length - 1]);
+
+      return ethers.utils.solidityPack(types, values);
+    }
+
+    async function pinMockV2Router() {
+      const RouterMock = await ethers.getContractFactory("MockSaucerV2Router");
+      const impl = await RouterMock.deploy();
+      await impl.deployed();
+
+      const runtime = await ethers.provider.getCode(impl.address);
+
+      await network.provider.send("hardhat_setCode", [
+        SAUCER_V2_ROUTER,
+        runtime,
+      ]);
+
+      const router = await ethers.getContractAt(
+        "MockSaucerV2Router",
+        SAUCER_V2_ROUTER
+      );
+
+      await router.setAmountOut(0);
+
+      return router;
+    }
+
+    async function deployProRataVault(base: string, quote: string) {
+      const Vault = await ethers.getContractFactory("PLEXProRataVault");
+
+      const v = (await Vault.deploy(
+        base,
+        quote,
+        distributor.address,
+        await deployer.getAddress(), // manager
+        0,                           // ownerFeeBips
+        WEEK_SECS,
+        DAY_SECS,
+        WEEK_SECS
+      )) as PLEXProRataVault;
+
+      await v.deployed();
+      return v;
+    }
+
+    async function initializeTokenTokenVault(
+      v = vault,
+      receiver?: string,
+      amount: BigNumber = ONE.mul(1_000)
+    ) {
+      const receiverAddr = receiver ?? (await deployer.getAddress());
+
+      await token0.connect(deployer).approve(v.address, amount);
+      await token1.connect(deployer).approve(v.address, amount);
+
+      await v.connect(deployer).initialize(
+        amount,
+        amount,
+        0,
+        receiverAddr,
+        await futureDeadline()
+      );
+
+      expect(await v.initialized()).to.equal(true);
+    }
+
+    async function initializeHbarBaseVault(v: PLEXProRataVault) {
+      const initBase = ONE.mul(1_000);  // HBAR side
+      const initQuote = ONE.mul(1_000); // token1 side
+
+      await token1.connect(deployer).approve(v.address, initQuote);
+
+      await v.connect(deployer).initialize(
+        initBase,
+        initQuote,
+        0,
+        await deployer.getAddress(),
+        await futureDeadline(),
+        { value: initBase }
+      );
+
+      expect(await v.initialized()).to.equal(true);
+    }
+
+    async function initializeHbarQuoteVault(v: PLEXProRataVault) {
+      const initBase = ONE.mul(1_000);  // token0 side
+      const initQuote = ONE.mul(1_000); // HBAR side
+
+      await token0.connect(deployer).approve(v.address, initBase);
+
+      await v.connect(deployer).initialize(
+        initBase,
+        initQuote,
+        0,
+        await deployer.getAddress(),
+        await futureDeadline(),
+        { value: initQuote }
+      );
+
+      expect(await v.initialized()).to.equal(true);
+    }
+
+    beforeEach(async () => {
+      mockV2Router = await pinMockV2Router();
+    });
+
+    it("bad encoded path length reverts", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(10);
+      const amountOutMin = ONE.mul(5);
+
+      const badPath = "0x1234";
+
+      await expect(
+        vault.connect(deployer).managerRebalanceSaucerV2(
+          true,
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          badPath
+        )
+      ).to.be.revertedWith("bad path");
+    });
+
+    it("bad first token reverts", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(10);
+      const amountOutMin = ONE.mul(5);
+
+      // baseToQuote=true means first token must be BASE/token0.
+      const badPath = encodeV2Path(
+        [token1.address, token0.address],
+        [FEE]
+      );
+
+      await expect(
+        vault.connect(deployer).managerRebalanceSaucerV2(
+          true,
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          badPath
+        )
+      ).to.be.revertedWith("bad tokenIn");
+    });
+
+    it("bad last token reverts", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(10);
+      const amountOutMin = ONE.mul(5);
+
+      // baseToQuote=true means last token must be QUOTE/token1.
+      const badPath = encodeV2Path(
+        [token0.address, token0.address],
+        [FEE]
+      );
+
+      await expect(
+        vault.connect(deployer).managerRebalanceSaucerV2(
+          true,
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          badPath
+        )
+      ).to.be.revertedWith("bad tokenOut");
+    });
+
+    it("token -> token exactInput succeeds", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(100);     // token0 in
+      const amountOutMin = ONE.mul(50);  // token1 out
+
+      const path = encodeV2Path(
+        [token0.address, token1.address],
+        [FEE]
+      );
+
+      // Fund hardcoded router with output token.
+      await token1.transfer(SAUCER_V2_ROUTER, amountOutMin);
+
+      const vaultBaseBefore = await token0.balanceOf(vault.address);
+      const vaultQuoteBefore = await token1.balanceOf(vault.address);
+      const routerBaseBefore = await token0.balanceOf(SAUCER_V2_ROUTER);
+
+      await expect(
+        vault.connect(deployer).managerRebalanceSaucerV2(
+          true,
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          path
+        )
+      )
+        .to.emit(vault, "ManagerRebalance")
+        .withArgs(
+          2,
+          true,
+          token0.address,
+          token1.address,
+          amountIn,
+          amountOutMin,
+          amountOutMin
+        );
+
+      const vaultBaseAfter = await token0.balanceOf(vault.address);
+      const vaultQuoteAfter = await token1.balanceOf(vault.address);
+      const routerBaseAfter = await token0.balanceOf(SAUCER_V2_ROUTER);
+
+      expect(vaultBaseBefore.sub(vaultBaseAfter)).to.equal(amountIn);
+      expect(vaultQuoteAfter.sub(vaultQuoteBefore)).to.equal(amountOutMin);
+      expect(routerBaseAfter.sub(routerBaseBefore)).to.equal(amountIn);
+    });
+
+    it("HBAR -> token multicall/refund path succeeds", async () => {
+      const hbarVault = await deployProRataVault(
+        ethers.constants.AddressZero, // BASE = HBAR
+        token1.address                // QUOTE = token1
+      );
+
+      await initializeHbarBaseVault(hbarVault);
+
+      const amountIn = ONE.mul(100);     // HBAR in
+      const amountOutMin = ONE.mul(50);  // token1 out
+
+      const path = encodeV2Path(
+        [WHBAR, token1.address],
+        [FEE]
+      );
+
+      // Fund router with output token.
+      await token1.transfer(SAUCER_V2_ROUTER, amountOutMin);
+
+      const hbarBefore = await ethers.provider.getBalance(hbarVault.address);
+      const quoteBefore = await token1.balanceOf(hbarVault.address);
+
+      await expect(
+        hbarVault.connect(deployer).managerRebalanceSaucerV2(
+          true, // BASE(HBAR) -> QUOTE(token1)
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          path
+        )
+      )
+        .to.emit(hbarVault, "ManagerRebalance")
+        .withArgs(
+          2,
+          true,
+          ethers.constants.AddressZero,
+          token1.address,
+          amountIn,
+          amountOutMin,
+          amountOutMin
+        );
+
+      const hbarAfter = await ethers.provider.getBalance(hbarVault.address);
+      const quoteAfter = await token1.balanceOf(hbarVault.address);
+
+      expect(hbarBefore.sub(hbarAfter)).to.equal(amountIn);
+      expect(quoteAfter.sub(quoteBefore)).to.equal(amountOutMin);
+    });
+
+    it("token -> HBAR multicall/unwrap path succeeds", async () => {
+      const hbarVault = await deployProRataVault(
+        token0.address,                // BASE = token0
+        ethers.constants.AddressZero   // QUOTE = HBAR
+      );
+
+      await initializeHbarQuoteVault(hbarVault);
+
+      const amountIn = ONE.mul(100);     // token0 in
+      const amountOutMin = ONE.mul(50);  // HBAR out
+
+      const path = encodeV2Path(
+        [token0.address, WHBAR],
+        [FEE]
+      );
+
+      // Fund router with native HBAR so unwrapWHBAR can pay vault.
+      await network.provider.send("hardhat_setBalance", [
+        SAUCER_V2_ROUTER,
+        amountOutMin.toHexString(),
+      ]);
+
+      const baseBefore = await token0.balanceOf(hbarVault.address);
+      const hbarBefore = await ethers.provider.getBalance(hbarVault.address);
+      const routerBaseBefore = await token0.balanceOf(SAUCER_V2_ROUTER);
+
+      await expect(
+        hbarVault.connect(deployer).managerRebalanceSaucerV2(
+          true, // BASE(token0) -> QUOTE(HBAR)
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          path
+        )
+      )
+        .to.emit(hbarVault, "ManagerRebalance")
+        .withArgs(
+          2,
+          true,
+          token0.address,
+          ethers.constants.AddressZero,
+          amountIn,
+          amountOutMin,
+          amountOutMin
+        );
+
+      const baseAfter = await token0.balanceOf(hbarVault.address);
+      const hbarAfter = await ethers.provider.getBalance(hbarVault.address);
+      const routerBaseAfter = await token0.balanceOf(SAUCER_V2_ROUTER);
+
+      expect(baseBefore.sub(baseAfter)).to.equal(amountIn);
+      expect(hbarAfter.sub(hbarBefore)).to.equal(amountOutMin);
+      expect(routerBaseAfter.sub(routerBaseBefore)).to.equal(amountIn);
+    });
+
+    it("amountOutMin enforced", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(100);
+      const amountOutMin = ONE.mul(50);
+      const actualOut = amountOutMin.sub(1);
+
+      const path = encodeV2Path(
+        [token0.address, token1.address],
+        [FEE]
+      );
+
+      await mockV2Router.setAmountOut(actualOut);
+
+      // No output funding needed because mock reverts before paying.
+      await expect(
+        vault.connect(deployer).managerRebalanceSaucerV2(
+          true,
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          path
+        )
+      ).to.be.revertedWith("MockV2: slippage");
+    });
+
+    it("exact amountIn spent", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(123);
+      const amountOutMin = ONE.mul(77);
+
+      const path = encodeV2Path(
+        [token0.address, token1.address],
+        [FEE]
+      );
+
+      await token1.transfer(SAUCER_V2_ROUTER, amountOutMin);
+
+      const vaultBaseBefore = await token0.balanceOf(vault.address);
+      const vaultQuoteBefore = await token1.balanceOf(vault.address);
+      const routerBaseBefore = await token0.balanceOf(SAUCER_V2_ROUTER);
+
+      await vault.connect(deployer).managerRebalanceSaucerV2(
+        true,
+        amountIn,
+        amountOutMin,
+        await futureDeadline(),
+        path
+      );
+
+      const vaultBaseAfter = await token0.balanceOf(vault.address);
+      const vaultQuoteAfter = await token1.balanceOf(vault.address);
+      const routerBaseAfter = await token0.balanceOf(SAUCER_V2_ROUTER);
+
+      expect(vaultBaseBefore.sub(vaultBaseAfter)).to.equal(amountIn);
+      expect(routerBaseAfter.sub(routerBaseBefore)).to.equal(amountIn);
+      expect(vaultQuoteAfter.sub(vaultQuoteBefore)).to.equal(amountOutMin);
+    });
+  });
 });
