@@ -907,7 +907,6 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
         return _userDeposits[user];
     }
 
-    // same
     function _allocDepositSlot() internal returns (uint256 id) {
         id = deposits.length;
         deposits.push();
@@ -917,7 +916,6 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
         delete deposits[id];
     }
 
-    // same
     function _removeUserDeposit(address user, uint256 id) internal {
         uint256[] storage arr = _userDeposits[user];
         for (uint256 i = 0; i < arr.length; i++) {
@@ -932,7 +930,6 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
 
     /* ───────────────────────── Rewards ───────────────────────── */
 
-    // same
     function _ensureListedReward(address rt) internal {
         for (uint256 i = 0; i < rewardTokens.length; i++) {
             if (rewardTokens[i] == rt) return;
@@ -941,14 +938,12 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
         rewardTokens.push(rt);
     }
 
-    // same
     function _eligibleShares() internal view returns (uint256) {
         uint256 ts = totalShares;
         uint256 fee = ownerFeeShares;
         return ts > fee ? (ts - fee) : 0;
     }
 
-    // same
     function _updateReward(address rt) internal {
         RewardData storage R = rewards[rt];
 
@@ -976,7 +971,6 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
         }
     }
 
-    // same
     function _settleRewards(address user) internal {
         uint256 len = rewardTokens.length;
         if (len == 0) return;
@@ -1002,7 +996,6 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
         }
     }
 
-    // same
     function onAirdropFunded(address rewardToken, uint256 netAmount) external {
         require(msg.sender == address(distributor), "only distributor");
         require(rewardToken != address(0), "HBAR reward unsupported");
@@ -1065,7 +1058,6 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
         }
     }
 
-    // same
     function claimRewards(address rewardToken) external nonReentrant {
         require(address(distributor) != address(0), "distributor not set");
 
@@ -1084,7 +1076,6 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
         }
     }
 
-    // same
     function claimAllRewards() external nonReentrant {
         require(address(distributor) != address(0), "distributor not set");
 
@@ -1109,7 +1100,6 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
 
     /* ───────────────────────── Management fee accrual ───────────────────────── */
 
-    // same
     function _applyPendingFee(uint64 effectiveTs) internal {
         uint32 previous = ownerFeeBips;
         uint32 next = pendingOwnerFeeBips;
@@ -1121,7 +1111,6 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
         emit OwnerFeeRateApplied(previous, next, effectiveTs);
     }
 
-    // same
     function _applyPendingFeeIfDue(uint64 nowTs) internal {
         uint64 effTs = pendingOwnerFeeTs;
 
@@ -1130,7 +1119,6 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
         }
     }
 
-    // same
     function _accrueMgmtFee() internal {
         uint64 nowTs = uint64(block.timestamp);
         uint64 last = lastFeeAccrual;
@@ -1158,7 +1146,6 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
         lastFeeAccrual = nowTs;
     }
 
-    // same
     function _accrueLinear(
         uint64 fromTs,
         uint64 toTs,
