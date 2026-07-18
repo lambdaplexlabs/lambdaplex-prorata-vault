@@ -165,6 +165,12 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
         uint256 amount
     );
 
+    event RewardWrittenOff(
+        address indexed rewardToken,
+        address indexed user,
+        uint256 amount
+    );
+
     /* ───────────────────────── Management fee ───────────────────────── */
 
     uint32 public constant MAX_OWNER_FEE_BIPS = 3_000; // 0.3% / week
@@ -1098,6 +1104,43 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
                     emit RewardClaimFailed(rt, msg.sender, amt);
                 }
             }
+        }
+    }
+
+    /// @notice Owner-gated resolution of a user's accrued rewards in a token that
+    ///         may have become permanently non-transferable (freeze / KYC gate /
+    ///         pause / blacklist), which would otherwise strand the accrual: it
+    ///         can be neither paid by `claimRewards` nor cleared.
+    /// @dev    Pay-if-possible: the vault first attempts to pay the user. If the
+    ///         token is transferable the user simply gets paid, so the owner can
+    ///         never destroy a claimable reward. Only when the transfer reverts
+    ///         (token genuinely cannot move) is the accrual written off. The
+    ///         underlying tokens then remain frozen in the (immutable)
+    ///         distributor's custody and its `remaining` is not reconciled, which
+    ///         is harmless: a frozen token cannot move and `claimTo` stays bounded
+    ///         by credited-claimed.
+    function ownerWriteOffReward(address user, address rewardToken)
+        external
+        nonReentrant
+        onlyOwner
+        returns (uint256 amount)
+    {
+        require(address(distributor) != address(0), "distributor not set");
+
+        _settleRewards(user);
+
+        UserReward storage U = userRewards[user][rewardToken];
+        amount = U.accrued;
+        require(amount > 0, "nothing accrued");
+
+        try distributor.claimTo(rewardToken, user, amount) {
+            // Token was transferable: the user is paid, nothing to write off.
+            U.accrued = 0;
+            emit RewardClaimed(rewardToken, user, amount);
+        } catch {
+            // Token cannot move: clear the stranded accrual.
+            U.accrued = 0;
+            emit RewardWrittenOff(rewardToken, user, amount);
         }
     }
 

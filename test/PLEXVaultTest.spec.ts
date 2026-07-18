@@ -3455,6 +3455,106 @@ describe("Vault", () => {
       expect(badState.accrued).to.be.gt(0);
     });
 
+    it("owner can write off a permanently stuck reward accrual; non-owner cannot", async () => {
+      const [, aliceSigner] = await ethers.getSigners();
+      const aliceAddr = await aliceSigner.getAddress();
+
+      const depositAmt = ONE.mul(1_000);
+      await initializeFor(aliceAddr, depositAmt);
+
+      const BadRewardTokenFactory = await ethers.getContractFactory("BadRewardToken");
+      const badReward = await BadRewardTokenFactory.deploy(
+        "BadReward",
+        "BAD",
+        8,
+        distributor.address,
+        ethers.utils.parseUnits("1000000000", 8)
+      );
+      await badReward.deployed();
+
+      await distributor.modifyAllowed(badReward.address, true);
+
+      const rewardAmount = ONE.mul(1_000_000);
+      await badReward.approve(distributor.address, rewardAmount);
+      await distributor.fund(vault.address, badReward.address, rewardAmount);
+
+      // Advance past the stream's end so the full amount has vested and no
+      // further rewards accrue after the write-off.
+      await increaseTime(WEEK_SECS + DAY_SECS);
+
+      // Claim fails (token permanently non-transferable), so the accrual is stuck.
+      await vault.connect(aliceSigner).claimRewards(badReward.address);
+      const stuck = await vault.userRewards(aliceAddr, badReward.address);
+      expect(stuck.accrued).to.be.gt(0);
+
+      // Non-owner cannot write off.
+      await expect(
+        vault.connect(aliceSigner).ownerWriteOffReward(aliceAddr, badReward.address)
+      ).to.be.revertedWithCustomError(vault, "OwnableUnauthorizedAccount");
+
+      // Owner writes off the stuck accrual, clearing the strand.
+      await expect(
+        vault.connect(deployer).ownerWriteOffReward(aliceAddr, badReward.address)
+      )
+        .to.emit(vault, "RewardWrittenOff")
+        .withArgs(badReward.address, aliceAddr, anyValue);
+
+      const cleared = await vault.userRewards(aliceAddr, badReward.address);
+      expect(cleared.accrued).to.equal(0);
+
+      // Nothing left to write off.
+      await expect(
+        vault.connect(deployer).ownerWriteOffReward(aliceAddr, badReward.address)
+      ).to.be.revertedWith("nothing accrued");
+    });
+
+    it("owner cannot destroy a claimable reward: healthy token pays the user instead", async () => {
+      const [, aliceSigner] = await ethers.getSigners();
+      const aliceAddr = await aliceSigner.getAddress();
+
+      const depositAmt = ONE.mul(1_000);
+      await initializeFor(aliceAddr, depositAmt);
+
+      // A normal, transferable reward token.
+      const ERC20MockFactory = await ethers.getContractFactory("ERC20Mock");
+      const goodReward = (await ERC20MockFactory.deploy(
+        "GoodReward",
+        "GOOD",
+        8,
+        INITIAL_MINT
+      )) as ERC20Mock;
+      await goodReward.deployed();
+
+      await distributor.modifyAllowed(goodReward.address, true);
+
+      const rewardAmount = ONE.mul(1_000_000);
+      await goodReward.approve(distributor.address, rewardAmount);
+      await distributor.fund(vault.address, goodReward.address, rewardAmount);
+
+      // Stream fully vests; the user has NOT claimed.
+      await increaseTime(WEEK_SECS + DAY_SECS);
+
+      const balBefore = await goodReward.balanceOf(aliceAddr);
+
+      // Owner calls the write-off on a healthy token. Because the token is
+      // transferable, the vault pays the user rather than destroying the reward.
+      const tx = await vault
+        .connect(deployer)
+        .ownerWriteOffReward(aliceAddr, goodReward.address);
+
+      await expect(tx)
+        .to.emit(vault, "RewardClaimed")
+        .withArgs(goodReward.address, aliceAddr, anyValue);
+      await expect(tx).to.not.emit(vault, "RewardWrittenOff");
+
+      const balAfter = await goodReward.balanceOf(aliceAddr);
+      expect(balAfter.sub(balBefore)).to.be.gt(0);
+
+      // Accrual is cleared because it was paid out, not written off.
+      const state = await vault.userRewards(aliceAddr, goodReward.address);
+      expect(state.accrued).to.equal(0);
+    });
+
     describe("airdrop rewards: onAirdropFunded access control & input sanity", () => {
       it("reverts if called by a non-distributor", async () => {
         await expect(

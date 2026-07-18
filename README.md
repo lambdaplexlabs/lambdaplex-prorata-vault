@@ -328,6 +328,23 @@ RewardClaimFailed(rewardToken, user, amount)
 
 and leaves the accrued amount intact for retry.
 
+### Permanently stuck rewards
+
+A reward token can become permanently non-transferable (freeze, KYC gate, pause, blacklist). In that state a user's accrual can be neither paid by `claimRewards` nor cleared, so it would remain stranded in the vault's accounting forever.
+
+The owner can resolve such an accrual:
+
+```solidity
+ownerWriteOffReward(address user, address rewardToken)
+```
+
+This is **pay-if-possible**, so the owner cannot use it to take rewards away from a user:
+
+- The vault first attempts to pay the user. If the token is transferable, the user is simply paid (`RewardClaimed`) — a healthy reward can never be destroyed this way.
+- Only if the transfer reverts (the token genuinely cannot move) is the accrual cleared and `RewardWrittenOff(rewardToken, user, amount)` emitted.
+
+A write-off clears only the vault-side accounting. The underlying tokens remain frozen in the distributor's custody; `remaining` is intentionally not reconciled, which is harmless because a frozen token cannot move and `claimTo` stays bounded by `credited - claimed`.
+
 ---
 
 ## AirdropDistributor
@@ -541,6 +558,7 @@ Sensitive functions include:
 - Owner fee shares do not receive rewards.
 - Users who join mid-stream are checkpointed so they cannot earn past rewards.
 - Users who exit to zero shares and re-enter later are checkpointed to prevent reward stealing.
+- `ownerWriteOffReward` is pay-if-possible: it pays the user when the token is transferable and only clears the accrual when the transfer reverts, so the owner cannot use it to take away a claimable reward (see [Permanently stuck rewards](#permanently-stuck-rewards)).
 
 ### Management fees
 
