@@ -409,6 +409,48 @@ For HBAR withdrawals:
 
 ---
 
+## Manager rebalance (SaucerSwap)
+
+The manager (or owner) can rebalance the vault's inventory between BASE and QUOTE by executing exact-input swaps on SaucerSwap:
+
+- `managerRebalanceSaucerV1(bool baseToQuote, uint256 amountIn, uint256 amountOutMin, uint256 deadline, address[] path)`
+- `managerRebalanceSaucerV2(bool baseToQuote, uint256 amountIn, uint256 amountOutMin, uint256 deadline, bytes path)`
+
+`baseToQuote` selects the swap direction. If a vault side is native HBAR, its endpoint in the route is the WHBAR token; the SaucerSwap router wraps and unwraps native HBAR for the vault.
+
+```solidity
+address public constant WHBAR_TOKEN =
+    0x0000000000000000000000000000000000163B5a;
+```
+
+### Path restrictions
+
+To bound manager routing, the swap path is constrained to two shapes only:
+
+- a **direct** swap: `tokenIn -> tokenOut`
+- a **single intermediate hop through WHBAR**: `tokenIn -> WHBAR -> tokenOut`
+
+Any other route is rejected:
+
+- The first token must match the input side of the vault and the last token must match the output side (`bad tokenIn` / `bad tokenOut`).
+- A path with an intermediate hop must use `WHBAR_TOKEN` as the intermediate (`bad hop`).
+- Paths with more than one intermediate hop, or with a malformed length, are rejected (`bad path`).
+
+Concretely:
+
+- Saucer V1 (`address[] path`): length must be exactly `2` (direct) or `3` (WHBAR hop).
+- Saucer V2 (`bytes path`, `token|fee|token|...`): length must be exactly `43` bytes (direct) or `66` bytes (WHBAR hop).
+
+### Other guards
+
+- Swaps are disabled in emergency mode and before initialization.
+- `deadline` must not be in the past; `amountIn > 0` and `amountOutMin > 0` are required.
+- The vault verifies that exactly `amountIn` of the input side was spent and that the realized output is at least `amountOutMin`.
+
+This narrows, but does not eliminate, the manager's market-making discretion: routing is confined to direct or WHBAR-intermediated pools, but the vault remains oracle-free with no per-transaction or per-epoch size cap. See [Market-making risk remains](#market-making-risk-remains).
+
+---
+
 ## Important product assumptions
 
 ### No oracle
@@ -512,6 +554,12 @@ Sensitive functions include:
 - Emergency mode is one-way.
 - Emergency withdrawals ignore lockup.
 - Emergency withdrawals use strict raw pro-rata accounting.
+
+### Manager rebalance
+
+- Only the manager or owner can rebalance; swaps are disabled in emergency mode.
+- Swap routes are restricted to a direct hop or a single WHBAR intermediate hop (see [Manager rebalance (SaucerSwap)](#manager-rebalance-saucerswap)).
+- The vault is oracle-free with no per-transaction or per-epoch size cap, so a compromised manager key remains a centralization risk.
 
 ---
 

@@ -4880,7 +4880,7 @@ describe("Vault", () => {
   // ─────────────────────────────────────────────────────────────
   describe("manager rebalance: SaucerSwap V1", () => {
 
-    const WHBAR = "0x0000000000000000000000000000000000163b59";
+    const WHBAR = "0x0000000000000000000000000000000000163b5a";
     const SAUCER_V1_ROUTER = "0x00000000000000000000000000000000002e7a5d";
 
     let mockV1Router: any;
@@ -5244,6 +5244,87 @@ describe("Vault", () => {
 
       expect(vaultQuoteAfter.sub(vaultQuoteBefore)).to.equal(amountOutMin);
     });
+
+    it("WHBAR intermediate hop rebalance succeeds", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(100);     // token0 in
+      const amountOutMin = ONE.mul(50);  // token1 out
+
+      // token0 -> WHBAR -> token1
+      const path = [token0.address, WHBAR, token1.address];
+
+      await token1.transfer(SAUCER_V1_ROUTER, amountOutMin);
+
+      const vaultBaseBefore = await token0.balanceOf(vault.address);
+      const vaultQuoteBefore = await token1.balanceOf(vault.address);
+
+      await expect(
+        vault.connect(deployer).managerRebalanceSaucerV1(
+          true, // BASE -> QUOTE
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          path
+        )
+      )
+        .to.emit(vault, "ManagerRebalance")
+        .withArgs(
+          1,
+          true,
+          token0.address,
+          token1.address,
+          amountIn,
+          amountOutMin,
+          amountOutMin
+        );
+
+      const vaultBaseAfter = await token0.balanceOf(vault.address);
+      const vaultQuoteAfter = await token1.balanceOf(vault.address);
+
+      expect(vaultBaseBefore.sub(vaultBaseAfter)).to.equal(amountIn);
+      expect(vaultQuoteAfter.sub(vaultQuoteBefore)).to.equal(amountOutMin);
+    });
+
+    it("non-WHBAR intermediate hop reverts", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(10);
+      const amountOutMin = ONE.mul(5);
+
+      // Middle hop is token0 (not WHBAR) -> disallowed.
+      const badPath = [token0.address, token0.address, token1.address];
+
+      await expect(
+        vault.connect(deployer).managerRebalanceSaucerV1(
+          true,
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          badPath
+        )
+      ).to.be.revertedWith("bad hop");
+    });
+
+    it("path longer than one intermediate hop reverts", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(10);
+      const amountOutMin = ONE.mul(5);
+
+      // Four tokens (two intermediate hops) -> disallowed even via WHBAR.
+      const badPath = [token0.address, WHBAR, WHBAR, token1.address];
+
+      await expect(
+        vault.connect(deployer).managerRebalanceSaucerV1(
+          true,
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          badPath
+        )
+      ).to.be.revertedWith("bad path");
+    });
   });
   // ─────────────────────────────────────────────────────────────
   // Manager rebalance: SaucerSwap V2
@@ -5251,7 +5332,7 @@ describe("Vault", () => {
   describe("manager rebalance: SaucerSwap V2", () => {
     const ONE = BigNumber.from(10).pow(8);
 
-    const WHBAR = "0x0000000000000000000000000000000000163b59";
+    const WHBAR = "0x0000000000000000000000000000000000163b5a";
     const SAUCER_V2_ROUTER = "0x00000000000000000000000000000000003c437a";
 
     const FEE = 500; // arbitrary v2 fee tier for encoded mock path
@@ -5657,6 +5738,84 @@ describe("Vault", () => {
       expect(vaultBaseBefore.sub(vaultBaseAfter)).to.equal(amountIn);
       expect(routerBaseAfter.sub(routerBaseBefore)).to.equal(amountIn);
       expect(vaultQuoteAfter.sub(vaultQuoteBefore)).to.equal(amountOutMin);
+    });
+
+    it("WHBAR intermediate hop exactInput succeeds", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(100);     // token0 in
+      const amountOutMin = ONE.mul(50);  // token1 out
+
+      // token0 -> WHBAR -> token1
+      const path = encodeV2Path(
+        [token0.address, WHBAR, token1.address],
+        [FEE, FEE]
+      );
+
+      await token1.transfer(SAUCER_V2_ROUTER, amountOutMin);
+
+      const vaultBaseBefore = await token0.balanceOf(vault.address);
+      const vaultQuoteBefore = await token1.balanceOf(vault.address);
+
+      await vault.connect(deployer).managerRebalanceSaucerV2(
+        true,
+        amountIn,
+        amountOutMin,
+        await futureDeadline(),
+        path
+      );
+
+      const vaultBaseAfter = await token0.balanceOf(vault.address);
+      const vaultQuoteAfter = await token1.balanceOf(vault.address);
+
+      expect(vaultBaseBefore.sub(vaultBaseAfter)).to.equal(amountIn);
+      expect(vaultQuoteAfter.sub(vaultQuoteBefore)).to.equal(amountOutMin);
+    });
+
+    it("non-WHBAR intermediate hop reverts", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(10);
+      const amountOutMin = ONE.mul(5);
+
+      // Middle hop is token0 (not WHBAR) -> disallowed.
+      const badPath = encodeV2Path(
+        [token0.address, token0.address, token1.address],
+        [FEE, FEE]
+      );
+
+      await expect(
+        vault.connect(deployer).managerRebalanceSaucerV2(
+          true,
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          badPath
+        )
+      ).to.be.revertedWith("bad hop");
+    });
+
+    it("path longer than one intermediate hop reverts", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(10);
+      const amountOutMin = ONE.mul(5);
+
+      // Two intermediate hops (89 bytes) -> disallowed even via WHBAR.
+      const badPath = encodeV2Path(
+        [token0.address, WHBAR, WHBAR, token1.address],
+        [FEE, FEE, FEE]
+      );
+
+      await expect(
+        vault.connect(deployer).managerRebalanceSaucerV2(
+          true,
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          badPath
+        )
+      ).to.be.revertedWith("bad path");
     });
   });
 });

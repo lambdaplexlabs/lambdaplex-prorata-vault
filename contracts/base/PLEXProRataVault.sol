@@ -199,8 +199,11 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
     /* ───────────────────────── SaucerSwap rebalance config ───────────────────────── */
 
     // SaucerSwap mainnet addresses
-    address public constant WHBAR =
-        0x0000000000000000000000000000000000163B59;
+    // WHBAR token. Used as the endpoint for HBAR sides (the router wraps /
+    // unwraps native HBAR for us) and as the only permitted intermediate hop
+    // for manager rebalances.
+    address public constant WHBAR_TOKEN =
+        0x0000000000000000000000000000000000163B5a;
     address public constant SAUCER_V1_FACTORY =
         0x0000000000000000000000000000000000103780;
     address public constant SAUCER_V1_ROUTER =
@@ -1297,7 +1300,7 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
     //-------------------- AMM Rebalances ---------------------
 
    function _ammToken(address vaultToken) internal pure returns (address) {
-        return vaultToken == address(0) ? WHBAR : vaultToken;
+        return vaultToken == address(0) ? WHBAR_TOKEN : vaultToken;
     }
 
     function _tokensForDirection(bool baseToQuote)
@@ -1342,12 +1345,18 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
         bool baseToQuote,
         address[] calldata path
     ) internal view returns (address tokenIn, address tokenOut) {
-        require(path.length >= 2, "bad path");
+        // Bound routing: only a direct swap (2 tokens) or a single WHBAR
+        // intermediate hop (3 tokens) is permitted.
+        require(path.length == 2 || path.length == 3, "bad path");
 
         (tokenIn, tokenOut) = _tokensForDirection(baseToQuote);
 
         require(path[0] == _ammToken(tokenIn), "bad tokenIn");
         require(path[path.length - 1] == _ammToken(tokenOut), "bad tokenOut");
+
+        if (path.length == 3) {
+            require(path[1] == WHBAR_TOKEN, "bad hop");
+        }
     }
 
     function _readV2Token(bytes calldata path, uint256 offset)
@@ -1366,9 +1375,10 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
         bool baseToQuote,
         bytes calldata path
     ) internal view returns (address tokenIn, address tokenOut) {
-        // tokenA(20) + fee(3) + tokenB(20)
-        require(path.length >= 43, "bad path");
-        require((path.length - 20) % 23 == 0, "bad path len");
+        // Bound routing: only a direct hop (43 bytes: token|fee|token) or a
+        // single WHBAR intermediate hop (66 bytes: token|fee|WHBAR|fee|token)
+        // is permitted.
+        require(path.length == 43 || path.length == 66, "bad path");
 
         (tokenIn, tokenOut) = _tokensForDirection(baseToQuote);
 
@@ -1377,6 +1387,11 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
 
         require(first == _ammToken(tokenIn), "bad tokenIn");
         require(last == _ammToken(tokenOut), "bad tokenOut");
+
+        if (path.length == 66) {
+            // Intermediate token sits after the first token(20) + fee(3).
+            require(_readV2Token(path, 23) == WHBAR_TOKEN, "bad hop");
+        }
     }
 
     /// @notice Manager-only exact-input rebalance through SaucerSwap V1.

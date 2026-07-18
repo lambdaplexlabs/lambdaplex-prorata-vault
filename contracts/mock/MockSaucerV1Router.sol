@@ -20,7 +20,7 @@ interface IERC20Like {
 ///      - supports token->token, HBAR->token, token->HBAR
 contract MockSaucerV1Router {
     address public constant WHBAR =
-        0x0000000000000000000000000000000000163B59;
+        0x0000000000000000000000000000000000163B5a;
 
     uint256 public amountOutOverride;
 
