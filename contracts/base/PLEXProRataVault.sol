@@ -128,6 +128,7 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
     struct RewardData {
         uint256 perShare;        // cumulative reward tokens per eligible share, 1e18 scale
         uint256 rate;            // reward tokens per second
+        uint256 perShareRemainder; // scaled reward dust carried between per-share updates
         uint128 carry;           // unallocated reward tokens / rounding leftovers
         uint64 lastUpdate;
         uint64 periodFinish;
@@ -953,6 +954,36 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
         return ts > fee ? (ts - fee) : 0;
     }
 
+    function _addRewardPerShare(
+        RewardData storage R,
+        uint256 rewardAmount,
+        uint256 eligible
+    ) internal {
+        uint256 increment = PRBMathCommon.mulDiv(
+            rewardAmount,
+            ONE_18,
+            eligible
+        );
+        uint256 remainder = mulmod(rewardAmount, ONE_18, eligible);
+
+        // The eligible share count may have changed since the previous update.
+        // Normalize the saved numerator against the current denominator before
+        // combining it with this interval's remainder.
+        uint256 oldRemainder = R.perShareRemainder;
+        increment += oldRemainder / eligible;
+        oldRemainder %= eligible;
+
+        // Both values are below eligible. addmod combines them without overflow;
+        // wrapping below the new remainder means their sum crossed eligible.
+        uint256 combinedRemainder = addmod(remainder, oldRemainder, eligible);
+        if (combinedRemainder < remainder) {
+            increment += 1;
+        }
+
+        R.perShare += increment;
+        R.perShareRemainder = combinedRemainder;
+    }
+
     function _updateReward(address rt) internal {
         RewardData storage R = rewards[rt];
 
@@ -968,7 +999,7 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
                 if (eligible == 0) {
                     R.carry += SafeCast.toUint128(R.rate * dt);
                 } else {
-                    R.perShare += (R.rate * dt * 1e18) / eligible;
+                    _addRewardPerShare(R, R.rate * dt, eligible);
                 }
             }
 
@@ -1180,7 +1211,7 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
 
         uint64 effTs = pendingOwnerFeeTs;
 
-        if (effTs != 0 && last < effTs && nowTs > effTs) {
+        if (effTs != 0 && last < effTs && nowTs >= effTs) {
             _accrueLinear(last, effTs, ownerFeeBips);
             _applyPendingFee(effTs);
             _accrueLinear(effTs, nowTs, ownerFeeBips);

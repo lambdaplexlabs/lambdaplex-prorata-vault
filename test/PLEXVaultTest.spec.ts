@@ -627,6 +627,42 @@ describe("Vault", () => {
       };
     }
 
+    it("accrues the notice window at the old rate at the exact effective timestamp", async () => {
+      const aliceAddr = await alice.getAddress();
+      const depositAmount = ONE.mul(1_000);
+
+      await token0.connect(deployer).approve(vault.address, depositAmount);
+      await token1.connect(deployer).approve(vault.address, depositAmount);
+      await vault.connect(deployer).initialize(
+        depositAmount,
+        depositAmount,
+        0,
+        aliceAddr,
+        await futureDeadline()
+      );
+
+      // The current rate is zero; the scheduled non-zero rate must only apply
+      // to time strictly after its effective timestamp.
+      await vault.scheduleOwnerFeeBips(3_000);
+      const effectiveTs = (await vault.pendingOwnerFeeTs()).toNumber();
+
+      await network.provider.send("hardhat_setBalance", [
+        distributor.address,
+        "0x8AC7230489E80000",
+      ]);
+      await network.provider.send("hardhat_impersonateAccount", [distributor.address]);
+      const distributorSigner = await ethers.getSigner(distributor.address);
+
+      await network.provider.send("evm_setNextBlockTimestamp", [effectiveTs]);
+      await vault.connect(distributorSigner).onAirdropFunded(token1.address, 1);
+
+      await network.provider.send("hardhat_stopImpersonatingAccount", [distributor.address]);
+
+      expect(await vault.ownerFeeBips()).to.equal(3_000);
+      expect(await vault.pendingOwnerFeeTs()).to.equal(0);
+      expect(await vault.ownerFeeShares()).to.equal(0);
+    });
+
     it("accrues owner fee shares once the scheduled rate becomes active", async () => {
       const {
         feeShares,
@@ -3104,6 +3140,83 @@ describe("Vault", () => {
 
     beforeEach(async () => {
       await distributor.modifyAllowed(token1.address, true);
+    });
+
+    it("does not lose a small stream when an account forces frequent updates", async () => {
+      const [holder, funder, griefer] = await ethers.getSigners();
+
+      const ERC20 = await ethers.getContractFactory("ERC20Mock");
+      const base = await ERC20.deploy("Base", "BASE", 8, 100_000_000);
+      const quote = await ERC20.deploy("Quote", "QUOTE", 8, 100_000_000);
+      const reward = await ERC20.deploy("Reward", "RWD", 8, 10_000_000);
+      await Promise.all([base.deployed(), quote.deployed(), reward.deployed()]);
+
+      const Distributor = await ethers.getContractFactory("AirdropDistributor");
+      const testDistributor = await Distributor.deploy();
+      await testDistributor.deployed();
+      await testDistributor.modifyAllowed(reward.address, true);
+
+      const Vault = await ethers.getContractFactory("PLEXProRataVault");
+      const deployVault = async () => {
+        const instance = await Vault.deploy(
+          base.address,
+          quote.address,
+          testDistributor.address,
+          holder.address,
+          0,
+          WEEK_SECS,
+          DAY_SECS,
+          WEEK_SECS
+        );
+        await instance.deployed();
+
+        const depositAmount = ONE.mul(4_000_000);
+        await base.approve(instance.address, depositAmount);
+        await quote.approve(instance.address, depositAmount);
+        const latest = await ethers.provider.getBlock("latest");
+        await instance.initialize(
+          depositAmount,
+          depositAmount,
+          0,
+          holder.address,
+          latest!.timestamp + 3_600
+        );
+        return instance;
+      };
+
+      const griefed = await deployVault();
+      const control = await deployVault();
+
+      const fundAmount = ONE.mul(1_000);
+      await reward.transfer(funder.address, fundAmount.mul(2));
+      await reward.connect(funder).approve(testDistributor.address, fundAmount.mul(2));
+      await testDistributor
+        .connect(funder)
+        .fund(griefed.address, reward.address, fundAmount);
+      await testDistributor
+        .connect(funder)
+        .fund(control.address, reward.address, fundAmount);
+
+      const start = (await ethers.provider.getBlock("latest"))!.timestamp;
+      for (let elapsed = 5; elapsed <= 100; elapsed += 5) {
+        await network.provider.send("evm_setNextBlockTimestamp", [start + elapsed]);
+        await griefed.connect(griefer).claimRewards(reward.address);
+      }
+
+      await network.provider.send("evm_setNextBlockTimestamp", [start + 101]);
+      const griefedBefore = await reward.balanceOf(holder.address);
+      await griefed.claimRewards(reward.address);
+      const griefedClaim = (await reward.balanceOf(holder.address)).sub(griefedBefore);
+
+      const controlBefore = await reward.balanceOf(holder.address);
+      await control.claimRewards(reward.address);
+      const controlClaim = (await reward.balanceOf(holder.address)).sub(controlBefore);
+
+      const rewardState = await griefed.rewards(reward.address);
+      expect(rewardState.perShare).to.be.gt(0);
+      expect(rewardState.perShareRemainder).to.be.lt(await griefed.totalShares());
+      expect(griefedClaim).to.equal(controlClaim);
+      expect(griefedClaim).to.be.gt(1_000_000);
     });
 
     it("single depositor accrues and can claim streaming rewards funded via distributor", async () => {
