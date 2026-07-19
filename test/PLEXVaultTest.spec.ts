@@ -674,6 +674,97 @@ describe("Vault", () => {
       expect(await vault.ownerFeeShares()).to.equal(0);
     });
 
+    it("splits fee-aware previews across a pending-rate boundary", async () => {
+      const aliceAddr = await alice.getAddress();
+      const Vault = await ethers.getContractFactory("PLEXProRataVault");
+      const feeVault = (await Vault.deploy(
+        token0.address,
+        token1.address,
+        distributor.address,
+        await deployer.getAddress(),
+        1_000,
+        WEEK_SECS,
+        DAY_SECS,
+        WEEK_SECS
+      )) as PLEXProRataVault;
+      await feeVault.deployed();
+
+      const initialAmount = ONE.mul(1_000);
+      await token0.approve(feeVault.address, initialAmount);
+      await token1.approve(feeVault.address, initialAmount);
+      await feeVault.initialize(
+        initialAmount,
+        initialAmount,
+        0,
+        aliceAddr,
+        await futureDeadline()
+      );
+
+      await feeVault.scheduleOwnerFeeBips(3_000);
+      const effectiveTs = (await feeVault.pendingOwnerFeeTs()).toNumber();
+      const lastAccrualTs = (await feeVault.lastFeeAccrual()).toNumber();
+
+      // Make the projection branch conditions explicit:
+      // effTs != 0, last < effTs, and (after the time jump) nowTs >= effTs.
+      expect(effectiveTs).to.not.equal(0);
+      expect(lastAccrualTs).to.be.lt(effectiveTs);
+      expect(effectiveTs - lastAccrualTs).to.equal(WEEK_SECS);
+
+      await setNextBlockTimestamp(effectiveTs + DAY_SECS);
+      const previewBlock = await ethers.provider.getBlock("latest");
+      expect(previewBlock!.timestamp).to.be.gte(effectiveTs);
+
+      const storedSupply = await feeVault.totalShares();
+      const feeDenominator = BigNumber.from(1_000_000).mul(WEEK_SECS);
+      const accrueSupply = (
+        supply: BigNumber,
+        elapsed: number,
+        rateBips: number
+      ) => {
+        const numerator = BigNumber.from(rateBips).mul(elapsed);
+        return supply.add(
+          supply.mul(numerator).div(feeDenominator.sub(numerator))
+        );
+      };
+
+      const oldRateSupply = accrueSupply(storedSupply, WEEK_SECS, 1_000);
+      const projectedSupply = accrueSupply(oldRateSupply, DAY_SECS, 3_000);
+      expect(projectedSupply).to.be.gt(storedSupply);
+
+      const baseBalance = await token0.balanceOf(feeVault.address);
+      const quoteBalance = await token1.balanceOf(feeVault.address);
+      const sharesToBurn = (await feeVault.userShares(aliceAddr)).div(2);
+
+      const withdrawPreview = await feeVault.previewWithdrawProRata(sharesToBurn);
+      expect(withdrawPreview.baseOut).to.equal(
+        sharesToAsset(sharesToBurn, baseBalance, projectedSupply)
+      );
+      expect(withdrawPreview.quoteOut).to.equal(
+        sharesToAsset(sharesToBurn, quoteBalance, projectedSupply)
+      );
+      expect(withdrawPreview.baseOut).to.be.lt(
+        sharesToAsset(sharesToBurn, baseBalance, storedSupply)
+      );
+
+      const baseMax = ONE.mul(100);
+      const quoteMax = ONE.mul(100);
+      const expectedDeposit = expectedDepositPreview(
+        baseMax,
+        quoteMax,
+        baseBalance,
+        quoteBalance,
+        projectedSupply
+      );
+      const depositPreview = await feeVault.previewDepositProRata(baseMax, quoteMax);
+
+      expect(depositPreview.baseIn).to.equal(expectedDeposit.baseIn);
+      expect(depositPreview.quoteIn).to.equal(expectedDeposit.quoteIn);
+      expect(depositPreview.sharesOut).to.equal(expectedDeposit.sharesOut);
+
+      // Previewing projects the fee but does not mutate the stored supply.
+      expect(await feeVault.totalShares()).to.equal(storedSupply);
+    });
+
     it("accrues owner fee shares once the scheduled rate becomes active", async () => {
       const {
         feeShares,

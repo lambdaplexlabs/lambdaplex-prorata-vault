@@ -617,7 +617,7 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
                 quoteMax,
                 _vaultBalance(BASE),
                 _vaultBalance(QUOTE),
-                totalShares
+                _projectMgmtFeeSupply(uint64(block.timestamp))
             );
     }
 
@@ -773,7 +773,7 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
     {
         require(shares > 0 && totalShares > 0, "bad shares");
 
-        uint256 supply = totalShares;
+        uint256 supply = _projectMgmtFeeSupply(uint64(block.timestamp));
         baseOut = _sharesToAsset(
             shares,
             _vaultBalance(BASE),
@@ -1202,6 +1202,57 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
         }
     }
 
+    function _projectMgmtFeeSupply(uint64 nowTs)
+        internal
+        view
+        returns (uint256 supply)
+    {
+        supply = totalShares;
+        uint64 last = lastFeeAccrual;
+
+        if (nowTs <= last || _eligibleShares() == 0) return supply;
+
+        uint64 effTs = pendingOwnerFeeTs;
+        if (effTs != 0 && last < effTs && nowTs >= effTs) {
+            supply = _feeSupplyAfter(supply, last, effTs, ownerFeeBips);
+            return _feeSupplyAfter(
+                supply,
+                effTs,
+                nowTs,
+                pendingOwnerFeeBips
+            );
+        }
+
+        uint32 rateBips = ownerFeeBips;
+        if (effTs != 0 && nowTs >= effTs) {
+            rateBips = pendingOwnerFeeBips;
+        }
+
+        return _feeSupplyAfter(supply, last, nowTs, rateBips);
+    }
+
+    function _feeSupplyAfter(
+        uint256 supply,
+        uint64 fromTs,
+        uint64 toTs,
+        uint32 rateBips
+    ) internal pure returns (uint256) {
+        if (toTs <= fromTs || rateBips == 0) return supply;
+
+        uint256 den = BPS * uint256(WEEK_SECS);
+        uint64 maxDt = uint64((den / rateBips) - 1);
+        uint64 t = fromTs;
+
+        while (t < toTs) {
+            uint64 dt = toTs - t > maxDt ? maxDt : toTs - t;
+            uint256 num = uint256(rateBips) * uint256(dt);
+            supply += (supply * num) / (den - num);
+            t += dt;
+        }
+
+        return supply;
+    }
+
     function _accrueMgmtFee() internal {
         uint64 nowTs = uint64(block.timestamp);
         uint64 last = lastFeeAccrual;
@@ -1244,20 +1295,26 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
 
         while (t < toTs) {
             uint64 chunkEnd = toTs - t > maxDt ? t + maxDt : toTs;
-            uint64 dt = chunkEnd - t;
+            uint256 supply = totalShares;
 
-            uint256 S = totalShares;
-            uint256 depositorShares = _eligibleShares();
+            if (_eligibleShares() != 0 && supply != 0) {
+                uint256 projectedSupply = _feeSupplyAfter(
+                    supply,
+                    t,
+                    chunkEnd,
+                    rateBips
+                );
+                uint256 feeShares = projectedSupply - supply;
 
-            if (depositorShares != 0 && S != 0) {
-                uint256 num = uint256(rateBips) * uint256(dt);
-                uint256 dS = (S * num) / (den - num);
-
-                if (dS != 0) {
-                    totalShares = S + dS;
-                    ownerFeeShares += dS;
-
-                    emit OwnerFeeAccrued(dS, t, chunkEnd, rateBips);
+                if (feeShares != 0) {
+                    totalShares = projectedSupply;
+                    ownerFeeShares += feeShares;
+                    emit OwnerFeeAccrued(
+                        feeShares,
+                        t,
+                        chunkEnd,
+                        rateBips
+                    );
                 }
             }
 

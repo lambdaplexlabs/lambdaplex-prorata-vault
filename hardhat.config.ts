@@ -9,7 +9,7 @@ const DEFAULT_COMPILER_SETTINGS = {
   settings: {
     optimizer: {
       enabled: true,
-      runs: 1000,
+      runs: 500,
     },
     viaIR: true
     // metadata: {
