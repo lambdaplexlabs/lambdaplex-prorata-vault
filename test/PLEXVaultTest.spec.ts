@@ -92,6 +92,17 @@ describe("Vault", () => {
       expect(await vault.QUOTE()).to.equal(token1.address);
       expect(await vault.distributor()).to.equal(distributor.address);
     });
+
+    it("disables ownership renunciation", async () => {
+      const ownerBefore = await vault.owner();
+
+      await expect(vault.renounceOwnership()).to.be.revertedWithCustomError(
+        vault,
+        "OwnershipRenunciationDisabled"
+      );
+
+      expect(await vault.owner()).to.equal(ownerBefore);
+    });
   });
 
   // ─────────────────────────────────────────────────────────────

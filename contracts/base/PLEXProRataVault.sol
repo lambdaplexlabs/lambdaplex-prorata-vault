@@ -29,6 +29,8 @@ interface IOwnable {
 contract PLEXProRataVault is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
+    error OwnershipRenunciationDisabled();
+
     /* ───────────────────────── Pair config ───────────────────────── */
 
     // If BASE or QUOTE equals address(0), that side is native HBAR.
@@ -294,6 +296,10 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
     }
 
     /* ───────────────────────── Admin ───────────────────────── */
+
+    function renounceOwnership() public pure override {
+        revert OwnershipRenunciationDisabled();
+    }
 
     function setManager(address manager_) external onlyOwner {
         require(manager_ != address(0), "manager=0");

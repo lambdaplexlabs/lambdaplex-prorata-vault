@@ -71,6 +71,19 @@ describe("AirdropDistributor", () => {
     await vault.deployed();
   });
 
+  describe("ownership", () => {
+    it("disables ownership renunciation", async () => {
+      const ownerBefore = await distributor.owner();
+
+      await expect(distributor.renounceOwnership()).to.be.revertedWithCustomError(
+        distributor,
+        "OwnershipRenunciationDisabled"
+      );
+
+      expect(await distributor.owner()).to.equal(ownerBefore);
+    });
+  });
+
   describe("token allowlist", () => {
     it("reverts fund() when token is NOT allowlisted (so it cannot be added/listed in the vault)", async () => {
       const aliceAddr = await alice.getAddress();
