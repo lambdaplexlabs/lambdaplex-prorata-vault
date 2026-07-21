@@ -2,8 +2,6 @@
 
 Solidity smart contracts for the Lambdaplex **oracle-free pro-rata pair vault** system on Hedera EVM.
 
-This vault design is intended for emerging token pairs, such as **PLEX/USDC**, where a reliable on-chain oracle feed may not yet exist.
-
 Unlike the Lambdaplex balanced vault, the pro-rata vault does **not** price BASE in QUOTE terms and does **not** attempt to keep the vault 50/50 by value. Instead, shares represent a proportional claim on the vault’s current inventory of both assets.
 
 Core contracts:
