@@ -29,6 +29,8 @@ interface IOwnable {
 contract PLEXProRataVault is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
+    error OwnershipRenunciationDisabled();
+
     /* ───────────────────────── Pair config ───────────────────────── */
 
     // If BASE or QUOTE equals address(0), that side is native HBAR.
@@ -128,6 +130,7 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
     struct RewardData {
         uint256 perShare;        // cumulative reward tokens per eligible share, 1e18 scale
         uint256 rate;            // reward tokens per second
+        uint256 perShareRemainder; // scaled reward dust carried between per-share updates
         uint128 carry;           // unallocated reward tokens / rounding leftovers
         uint64 lastUpdate;
         uint64 periodFinish;
@@ -160,6 +163,12 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
     );
 
     event RewardClaimFailed(
+        address indexed rewardToken,
+        address indexed user,
+        uint256 amount
+    );
+
+    event RewardWrittenOff(
         address indexed rewardToken,
         address indexed user,
         uint256 amount
@@ -199,8 +208,11 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
     /* ───────────────────────── SaucerSwap rebalance config ───────────────────────── */
 
     // SaucerSwap mainnet addresses
-    address public constant WHBAR =
-        0x0000000000000000000000000000000000163B59;
+    // WHBAR token. Used as the endpoint for HBAR sides (the router wraps /
+    // unwraps native HBAR for us) and as the only permitted intermediate hop
+    // for manager rebalances.
+    address public constant WHBAR_TOKEN =
+        0x0000000000000000000000000000000000163B5a;
     address public constant SAUCER_V1_FACTORY =
         0x0000000000000000000000000000000000103780;
     address public constant SAUCER_V1_ROUTER =
@@ -284,6 +296,10 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
     }
 
     /* ───────────────────────── Admin ───────────────────────── */
+
+    function renounceOwnership() public pure override {
+        revert OwnershipRenunciationDisabled();
+    }
 
     function setManager(address manager_) external onlyOwner {
         require(manager_ != address(0), "manager=0");
@@ -601,7 +617,7 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
                 quoteMax,
                 _vaultBalance(BASE),
                 _vaultBalance(QUOTE),
-                totalShares
+                _projectMgmtFeeSupply(uint64(block.timestamp))
             );
     }
 
@@ -757,7 +773,7 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
     {
         require(shares > 0 && totalShares > 0, "bad shares");
 
-        uint256 supply = totalShares;
+        uint256 supply = _projectMgmtFeeSupply(uint64(block.timestamp));
         baseOut = _sharesToAsset(
             shares,
             _vaultBalance(BASE),
@@ -944,6 +960,36 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
         return ts > fee ? (ts - fee) : 0;
     }
 
+    function _addRewardPerShare(
+        RewardData storage R,
+        uint256 rewardAmount,
+        uint256 eligible
+    ) internal {
+        uint256 increment = PRBMathCommon.mulDiv(
+            rewardAmount,
+            ONE_18,
+            eligible
+        );
+        uint256 remainder = mulmod(rewardAmount, ONE_18, eligible);
+
+        // The eligible share count may have changed since the previous update.
+        // Normalize the saved numerator against the current denominator before
+        // combining it with this interval's remainder.
+        uint256 oldRemainder = R.perShareRemainder;
+        increment += oldRemainder / eligible;
+        oldRemainder %= eligible;
+
+        // Both values are below eligible. addmod combines them without overflow;
+        // wrapping below the new remainder means their sum crossed eligible.
+        uint256 combinedRemainder = addmod(remainder, oldRemainder, eligible);
+        if (combinedRemainder < remainder) {
+            increment += 1;
+        }
+
+        R.perShare += increment;
+        R.perShareRemainder = combinedRemainder;
+    }
+
     function _updateReward(address rt) internal {
         RewardData storage R = rewards[rt];
 
@@ -959,7 +1005,7 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
                 if (eligible == 0) {
                     R.carry += SafeCast.toUint128(R.rate * dt);
                 } else {
-                    R.perShare += (R.rate * dt * 1e18) / eligible;
+                    _addRewardPerShare(R, R.rate * dt, eligible);
                 }
             }
 
@@ -1098,6 +1144,43 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
         }
     }
 
+    /// @notice Owner-gated resolution of a user's accrued rewards in a token that
+    ///         may have become permanently non-transferable (freeze / KYC gate /
+    ///         pause / blacklist), which would otherwise strand the accrual: it
+    ///         can be neither paid by `claimRewards` nor cleared.
+    /// @dev    Pay-if-possible: the vault first attempts to pay the user. If the
+    ///         token is transferable the user simply gets paid, so the owner can
+    ///         never destroy a claimable reward. Only when the transfer reverts
+    ///         (token genuinely cannot move) is the accrual written off. The
+    ///         underlying tokens then remain frozen in the (immutable)
+    ///         distributor's custody and its `remaining` is not reconciled, which
+    ///         is harmless: a frozen token cannot move and `claimTo` stays bounded
+    ///         by credited-claimed.
+    function ownerWriteOffReward(address user, address rewardToken)
+        external
+        nonReentrant
+        onlyOwner
+        returns (uint256 amount)
+    {
+        require(address(distributor) != address(0), "distributor not set");
+
+        _settleRewards(user);
+
+        UserReward storage U = userRewards[user][rewardToken];
+        amount = U.accrued;
+        require(amount > 0, "nothing accrued");
+
+        try distributor.claimTo(rewardToken, user, amount) {
+            // Token was transferable: the user is paid, nothing to write off.
+            U.accrued = 0;
+            emit RewardClaimed(rewardToken, user, amount);
+        } catch {
+            // Token cannot move: clear the stranded accrual.
+            U.accrued = 0;
+            emit RewardWrittenOff(rewardToken, user, amount);
+        }
+    }
+
     /* ───────────────────────── Management fee accrual ───────────────────────── */
 
     function _applyPendingFee(uint64 effectiveTs) internal {
@@ -1119,6 +1202,57 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
         }
     }
 
+    function _projectMgmtFeeSupply(uint64 nowTs)
+        internal
+        view
+        returns (uint256 supply)
+    {
+        supply = totalShares;
+        uint64 last = lastFeeAccrual;
+
+        if (nowTs <= last || _eligibleShares() == 0) return supply;
+
+        uint64 effTs = pendingOwnerFeeTs;
+        if (effTs != 0 && last < effTs && nowTs >= effTs) {
+            supply = _feeSupplyAfter(supply, last, effTs, ownerFeeBips);
+            return _feeSupplyAfter(
+                supply,
+                effTs,
+                nowTs,
+                pendingOwnerFeeBips
+            );
+        }
+
+        uint32 rateBips = ownerFeeBips;
+        if (effTs != 0 && nowTs >= effTs) {
+            rateBips = pendingOwnerFeeBips;
+        }
+
+        return _feeSupplyAfter(supply, last, nowTs, rateBips);
+    }
+
+    function _feeSupplyAfter(
+        uint256 supply,
+        uint64 fromTs,
+        uint64 toTs,
+        uint32 rateBips
+    ) internal pure returns (uint256) {
+        if (toTs <= fromTs || rateBips == 0) return supply;
+
+        uint256 den = BPS * uint256(WEEK_SECS);
+        uint64 maxDt = uint64((den / rateBips) - 1);
+        uint64 t = fromTs;
+
+        while (t < toTs) {
+            uint64 dt = toTs - t > maxDt ? maxDt : toTs - t;
+            uint256 num = uint256(rateBips) * uint256(dt);
+            supply += (supply * num) / (den - num);
+            t += dt;
+        }
+
+        return supply;
+    }
+
     function _accrueMgmtFee() internal {
         uint64 nowTs = uint64(block.timestamp);
         uint64 last = lastFeeAccrual;
@@ -1134,7 +1268,7 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
 
         uint64 effTs = pendingOwnerFeeTs;
 
-        if (effTs != 0 && last < effTs && nowTs > effTs) {
+        if (effTs != 0 && last < effTs && nowTs >= effTs) {
             _accrueLinear(last, effTs, ownerFeeBips);
             _applyPendingFee(effTs);
             _accrueLinear(effTs, nowTs, ownerFeeBips);
@@ -1161,20 +1295,26 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
 
         while (t < toTs) {
             uint64 chunkEnd = toTs - t > maxDt ? t + maxDt : toTs;
-            uint64 dt = chunkEnd - t;
+            uint256 supply = totalShares;
 
-            uint256 S = totalShares;
-            uint256 depositorShares = _eligibleShares();
+            if (_eligibleShares() != 0 && supply != 0) {
+                uint256 projectedSupply = _feeSupplyAfter(
+                    supply,
+                    t,
+                    chunkEnd,
+                    rateBips
+                );
+                uint256 feeShares = projectedSupply - supply;
 
-            if (depositorShares != 0 && S != 0) {
-                uint256 num = uint256(rateBips) * uint256(dt);
-                uint256 dS = (S * num) / (den - num);
-
-                if (dS != 0) {
-                    totalShares = S + dS;
-                    ownerFeeShares += dS;
-
-                    emit OwnerFeeAccrued(dS, t, chunkEnd, rateBips);
+                if (feeShares != 0) {
+                    totalShares = projectedSupply;
+                    ownerFeeShares += feeShares;
+                    emit OwnerFeeAccrued(
+                        feeShares,
+                        t,
+                        chunkEnd,
+                        rateBips
+                    );
                 }
             }
 
@@ -1297,7 +1437,7 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
     //-------------------- AMM Rebalances ---------------------
 
    function _ammToken(address vaultToken) internal pure returns (address) {
-        return vaultToken == address(0) ? WHBAR : vaultToken;
+        return vaultToken == address(0) ? WHBAR_TOKEN : vaultToken;
     }
 
     function _tokensForDirection(bool baseToQuote)
@@ -1342,12 +1482,18 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
         bool baseToQuote,
         address[] calldata path
     ) internal view returns (address tokenIn, address tokenOut) {
-        require(path.length >= 2, "bad path");
+        // Bound routing: only a direct swap (2 tokens) or a single WHBAR
+        // intermediate hop (3 tokens) is permitted.
+        require(path.length == 2 || path.length == 3, "bad path");
 
         (tokenIn, tokenOut) = _tokensForDirection(baseToQuote);
 
         require(path[0] == _ammToken(tokenIn), "bad tokenIn");
         require(path[path.length - 1] == _ammToken(tokenOut), "bad tokenOut");
+
+        if (path.length == 3) {
+            require(path[1] == WHBAR_TOKEN, "bad hop");
+        }
     }
 
     function _readV2Token(bytes calldata path, uint256 offset)
@@ -1366,9 +1512,10 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
         bool baseToQuote,
         bytes calldata path
     ) internal view returns (address tokenIn, address tokenOut) {
-        // tokenA(20) + fee(3) + tokenB(20)
-        require(path.length >= 43, "bad path");
-        require((path.length - 20) % 23 == 0, "bad path len");
+        // Bound routing: only a direct hop (43 bytes: token|fee|token) or a
+        // single WHBAR intermediate hop (66 bytes: token|fee|WHBAR|fee|token)
+        // is permitted.
+        require(path.length == 43 || path.length == 66, "bad path");
 
         (tokenIn, tokenOut) = _tokensForDirection(baseToQuote);
 
@@ -1377,6 +1524,11 @@ contract PLEXProRataVault is Ownable, ReentrancyGuard {
 
         require(first == _ammToken(tokenIn), "bad tokenIn");
         require(last == _ammToken(tokenOut), "bad tokenOut");
+
+        if (path.length == 66) {
+            // Intermediate token sits after the first token(20) + fee(3).
+            require(_readV2Token(path, 23) == WHBAR_TOKEN, "bad hop");
+        }
     }
 
     /// @notice Manager-only exact-input rebalance through SaucerSwap V1.

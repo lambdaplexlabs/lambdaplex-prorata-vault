@@ -4,12 +4,14 @@ import * as dotenv from 'dotenv';
 
 dotenv.config();
 
+const testnetPrivateKey = process.env.TESTNET_MYPRIVATEKEY?.trim();
+
 const DEFAULT_COMPILER_SETTINGS = {
   version: '0.8.24',
   settings: {
     optimizer: {
       enabled: true,
-      runs: 1000,
+      runs: 500,
     },
     viaIR: true
     // metadata: {
@@ -33,7 +35,7 @@ const config: HardhatUserConfig = {
     hederaTestnet: {
       url: "https://testnet.hashio.io/api",
       chainId: 296,
-      accounts: [process.env.TESTNET_MYPRIVATEKEY!], // 0x...
+      accounts: testnetPrivateKey ? [testnetPrivateKey] : [],
     },
   },
 };

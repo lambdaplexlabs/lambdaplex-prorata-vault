@@ -92,6 +92,17 @@ describe("Vault", () => {
       expect(await vault.QUOTE()).to.equal(token1.address);
       expect(await vault.distributor()).to.equal(distributor.address);
     });
+
+    it("disables ownership renunciation", async () => {
+      const ownerBefore = await vault.owner();
+
+      await expect(vault.renounceOwnership()).to.be.revertedWithCustomError(
+        vault,
+        "OwnershipRenunciationDisabled"
+      );
+
+      expect(await vault.owner()).to.equal(ownerBefore);
+    });
   });
 
   // ─────────────────────────────────────────────────────────────
@@ -626,6 +637,133 @@ describe("Vault", () => {
         depositorShares,
       };
     }
+
+    it("accrues the notice window at the old rate at the exact effective timestamp", async () => {
+      const aliceAddr = await alice.getAddress();
+      const depositAmount = ONE.mul(1_000);
+
+      await token0.connect(deployer).approve(vault.address, depositAmount);
+      await token1.connect(deployer).approve(vault.address, depositAmount);
+      await vault.connect(deployer).initialize(
+        depositAmount,
+        depositAmount,
+        0,
+        aliceAddr,
+        await futureDeadline()
+      );
+
+      // The current rate is zero; the scheduled non-zero rate must only apply
+      // to time strictly after its effective timestamp.
+      await vault.scheduleOwnerFeeBips(3_000);
+      const effectiveTs = (await vault.pendingOwnerFeeTs()).toNumber();
+
+      await network.provider.send("hardhat_setBalance", [
+        distributor.address,
+        "0x8AC7230489E80000",
+      ]);
+      await network.provider.send("hardhat_impersonateAccount", [distributor.address]);
+      const distributorSigner = await ethers.getSigner(distributor.address);
+
+      await network.provider.send("evm_setNextBlockTimestamp", [effectiveTs]);
+      await vault.connect(distributorSigner).onAirdropFunded(token1.address, 1);
+
+      await network.provider.send("hardhat_stopImpersonatingAccount", [distributor.address]);
+
+      expect(await vault.ownerFeeBips()).to.equal(3_000);
+      expect(await vault.pendingOwnerFeeTs()).to.equal(0);
+      expect(await vault.ownerFeeShares()).to.equal(0);
+    });
+
+    it("splits fee-aware previews across a pending-rate boundary", async () => {
+      const aliceAddr = await alice.getAddress();
+      const Vault = await ethers.getContractFactory("PLEXProRataVault");
+      const feeVault = (await Vault.deploy(
+        token0.address,
+        token1.address,
+        distributor.address,
+        await deployer.getAddress(),
+        1_000,
+        WEEK_SECS,
+        DAY_SECS,
+        WEEK_SECS
+      )) as PLEXProRataVault;
+      await feeVault.deployed();
+
+      const initialAmount = ONE.mul(1_000);
+      await token0.approve(feeVault.address, initialAmount);
+      await token1.approve(feeVault.address, initialAmount);
+      await feeVault.initialize(
+        initialAmount,
+        initialAmount,
+        0,
+        aliceAddr,
+        await futureDeadline()
+      );
+
+      await feeVault.scheduleOwnerFeeBips(3_000);
+      const effectiveTs = (await feeVault.pendingOwnerFeeTs()).toNumber();
+      const lastAccrualTs = (await feeVault.lastFeeAccrual()).toNumber();
+
+      // Make the projection branch conditions explicit:
+      // effTs != 0, last < effTs, and (after the time jump) nowTs >= effTs.
+      expect(effectiveTs).to.not.equal(0);
+      expect(lastAccrualTs).to.be.lt(effectiveTs);
+      expect(effectiveTs - lastAccrualTs).to.equal(WEEK_SECS);
+
+      await setNextBlockTimestamp(effectiveTs + DAY_SECS);
+      const previewBlock = await ethers.provider.getBlock("latest");
+      expect(previewBlock!.timestamp).to.be.gte(effectiveTs);
+
+      const storedSupply = await feeVault.totalShares();
+      const feeDenominator = BigNumber.from(1_000_000).mul(WEEK_SECS);
+      const accrueSupply = (
+        supply: BigNumber,
+        elapsed: number,
+        rateBips: number
+      ) => {
+        const numerator = BigNumber.from(rateBips).mul(elapsed);
+        return supply.add(
+          supply.mul(numerator).div(feeDenominator.sub(numerator))
+        );
+      };
+
+      const oldRateSupply = accrueSupply(storedSupply, WEEK_SECS, 1_000);
+      const projectedSupply = accrueSupply(oldRateSupply, DAY_SECS, 3_000);
+      expect(projectedSupply).to.be.gt(storedSupply);
+
+      const baseBalance = await token0.balanceOf(feeVault.address);
+      const quoteBalance = await token1.balanceOf(feeVault.address);
+      const sharesToBurn = (await feeVault.userShares(aliceAddr)).div(2);
+
+      const withdrawPreview = await feeVault.previewWithdrawProRata(sharesToBurn);
+      expect(withdrawPreview.baseOut).to.equal(
+        sharesToAsset(sharesToBurn, baseBalance, projectedSupply)
+      );
+      expect(withdrawPreview.quoteOut).to.equal(
+        sharesToAsset(sharesToBurn, quoteBalance, projectedSupply)
+      );
+      expect(withdrawPreview.baseOut).to.be.lt(
+        sharesToAsset(sharesToBurn, baseBalance, storedSupply)
+      );
+
+      const baseMax = ONE.mul(100);
+      const quoteMax = ONE.mul(100);
+      const expectedDeposit = expectedDepositPreview(
+        baseMax,
+        quoteMax,
+        baseBalance,
+        quoteBalance,
+        projectedSupply
+      );
+      const depositPreview = await feeVault.previewDepositProRata(baseMax, quoteMax);
+
+      expect(depositPreview.baseIn).to.equal(expectedDeposit.baseIn);
+      expect(depositPreview.quoteIn).to.equal(expectedDeposit.quoteIn);
+      expect(depositPreview.sharesOut).to.equal(expectedDeposit.sharesOut);
+
+      // Previewing projects the fee but does not mutate the stored supply.
+      expect(await feeVault.totalShares()).to.equal(storedSupply);
+    });
 
     it("accrues owner fee shares once the scheduled rate becomes active", async () => {
       const {
@@ -3106,6 +3244,83 @@ describe("Vault", () => {
       await distributor.modifyAllowed(token1.address, true);
     });
 
+    it("does not lose a small stream when an account forces frequent updates", async () => {
+      const [holder, funder, griefer] = await ethers.getSigners();
+
+      const ERC20 = await ethers.getContractFactory("ERC20Mock");
+      const base = await ERC20.deploy("Base", "BASE", 8, 100_000_000);
+      const quote = await ERC20.deploy("Quote", "QUOTE", 8, 100_000_000);
+      const reward = await ERC20.deploy("Reward", "RWD", 8, 10_000_000);
+      await Promise.all([base.deployed(), quote.deployed(), reward.deployed()]);
+
+      const Distributor = await ethers.getContractFactory("AirdropDistributor");
+      const testDistributor = await Distributor.deploy();
+      await testDistributor.deployed();
+      await testDistributor.modifyAllowed(reward.address, true);
+
+      const Vault = await ethers.getContractFactory("PLEXProRataVault");
+      const deployVault = async () => {
+        const instance = await Vault.deploy(
+          base.address,
+          quote.address,
+          testDistributor.address,
+          holder.address,
+          0,
+          WEEK_SECS,
+          DAY_SECS,
+          WEEK_SECS
+        );
+        await instance.deployed();
+
+        const depositAmount = ONE.mul(4_000_000);
+        await base.approve(instance.address, depositAmount);
+        await quote.approve(instance.address, depositAmount);
+        const latest = await ethers.provider.getBlock("latest");
+        await instance.initialize(
+          depositAmount,
+          depositAmount,
+          0,
+          holder.address,
+          latest!.timestamp + 3_600
+        );
+        return instance;
+      };
+
+      const griefed = await deployVault();
+      const control = await deployVault();
+
+      const fundAmount = ONE.mul(1_000);
+      await reward.transfer(funder.address, fundAmount.mul(2));
+      await reward.connect(funder).approve(testDistributor.address, fundAmount.mul(2));
+      await testDistributor
+        .connect(funder)
+        .fund(griefed.address, reward.address, fundAmount);
+      await testDistributor
+        .connect(funder)
+        .fund(control.address, reward.address, fundAmount);
+
+      const start = (await ethers.provider.getBlock("latest"))!.timestamp;
+      for (let elapsed = 5; elapsed <= 100; elapsed += 5) {
+        await network.provider.send("evm_setNextBlockTimestamp", [start + elapsed]);
+        await griefed.connect(griefer).claimRewards(reward.address);
+      }
+
+      await network.provider.send("evm_setNextBlockTimestamp", [start + 101]);
+      const griefedBefore = await reward.balanceOf(holder.address);
+      await griefed.claimRewards(reward.address);
+      const griefedClaim = (await reward.balanceOf(holder.address)).sub(griefedBefore);
+
+      const controlBefore = await reward.balanceOf(holder.address);
+      await control.claimRewards(reward.address);
+      const controlClaim = (await reward.balanceOf(holder.address)).sub(controlBefore);
+
+      const rewardState = await griefed.rewards(reward.address);
+      expect(rewardState.perShare).to.be.gt(0);
+      expect(rewardState.perShareRemainder).to.be.lt(await griefed.totalShares());
+      expect(griefedClaim).to.equal(controlClaim);
+      expect(griefedClaim).to.be.gt(1_000_000);
+    });
+
     it("single depositor accrues and can claim streaming rewards funded via distributor", async () => {
       const [, aliceSigner] = await ethers.getSigners();
       const aliceAddr = await aliceSigner.getAddress();
@@ -3453,6 +3668,106 @@ describe("Vault", () => {
 
       expect(goodState.accrued).to.equal(0);
       expect(badState.accrued).to.be.gt(0);
+    });
+
+    it("owner can write off a permanently stuck reward accrual; non-owner cannot", async () => {
+      const [, aliceSigner] = await ethers.getSigners();
+      const aliceAddr = await aliceSigner.getAddress();
+
+      const depositAmt = ONE.mul(1_000);
+      await initializeFor(aliceAddr, depositAmt);
+
+      const BadRewardTokenFactory = await ethers.getContractFactory("BadRewardToken");
+      const badReward = await BadRewardTokenFactory.deploy(
+        "BadReward",
+        "BAD",
+        8,
+        distributor.address,
+        ethers.utils.parseUnits("1000000000", 8)
+      );
+      await badReward.deployed();
+
+      await distributor.modifyAllowed(badReward.address, true);
+
+      const rewardAmount = ONE.mul(1_000_000);
+      await badReward.approve(distributor.address, rewardAmount);
+      await distributor.fund(vault.address, badReward.address, rewardAmount);
+
+      // Advance past the stream's end so the full amount has vested and no
+      // further rewards accrue after the write-off.
+      await increaseTime(WEEK_SECS + DAY_SECS);
+
+      // Claim fails (token permanently non-transferable), so the accrual is stuck.
+      await vault.connect(aliceSigner).claimRewards(badReward.address);
+      const stuck = await vault.userRewards(aliceAddr, badReward.address);
+      expect(stuck.accrued).to.be.gt(0);
+
+      // Non-owner cannot write off.
+      await expect(
+        vault.connect(aliceSigner).ownerWriteOffReward(aliceAddr, badReward.address)
+      ).to.be.revertedWithCustomError(vault, "OwnableUnauthorizedAccount");
+
+      // Owner writes off the stuck accrual, clearing the strand.
+      await expect(
+        vault.connect(deployer).ownerWriteOffReward(aliceAddr, badReward.address)
+      )
+        .to.emit(vault, "RewardWrittenOff")
+        .withArgs(badReward.address, aliceAddr, anyValue);
+
+      const cleared = await vault.userRewards(aliceAddr, badReward.address);
+      expect(cleared.accrued).to.equal(0);
+
+      // Nothing left to write off.
+      await expect(
+        vault.connect(deployer).ownerWriteOffReward(aliceAddr, badReward.address)
+      ).to.be.revertedWith("nothing accrued");
+    });
+
+    it("owner cannot destroy a claimable reward: healthy token pays the user instead", async () => {
+      const [, aliceSigner] = await ethers.getSigners();
+      const aliceAddr = await aliceSigner.getAddress();
+
+      const depositAmt = ONE.mul(1_000);
+      await initializeFor(aliceAddr, depositAmt);
+
+      // A normal, transferable reward token.
+      const ERC20MockFactory = await ethers.getContractFactory("ERC20Mock");
+      const goodReward = (await ERC20MockFactory.deploy(
+        "GoodReward",
+        "GOOD",
+        8,
+        INITIAL_MINT
+      )) as ERC20Mock;
+      await goodReward.deployed();
+
+      await distributor.modifyAllowed(goodReward.address, true);
+
+      const rewardAmount = ONE.mul(1_000_000);
+      await goodReward.approve(distributor.address, rewardAmount);
+      await distributor.fund(vault.address, goodReward.address, rewardAmount);
+
+      // Stream fully vests; the user has NOT claimed.
+      await increaseTime(WEEK_SECS + DAY_SECS);
+
+      const balBefore = await goodReward.balanceOf(aliceAddr);
+
+      // Owner calls the write-off on a healthy token. Because the token is
+      // transferable, the vault pays the user rather than destroying the reward.
+      const tx = await vault
+        .connect(deployer)
+        .ownerWriteOffReward(aliceAddr, goodReward.address);
+
+      await expect(tx)
+        .to.emit(vault, "RewardClaimed")
+        .withArgs(goodReward.address, aliceAddr, anyValue);
+      await expect(tx).to.not.emit(vault, "RewardWrittenOff");
+
+      const balAfter = await goodReward.balanceOf(aliceAddr);
+      expect(balAfter.sub(balBefore)).to.be.gt(0);
+
+      // Accrual is cleared because it was paid out, not written off.
+      const state = await vault.userRewards(aliceAddr, goodReward.address);
+      expect(state.accrued).to.equal(0);
     });
 
     describe("airdrop rewards: onAirdropFunded access control & input sanity", () => {
@@ -4880,7 +5195,7 @@ describe("Vault", () => {
   // ─────────────────────────────────────────────────────────────
   describe("manager rebalance: SaucerSwap V1", () => {
 
-    const WHBAR = "0x0000000000000000000000000000000000163b59";
+    const WHBAR = "0x0000000000000000000000000000000000163b5a";
     const SAUCER_V1_ROUTER = "0x00000000000000000000000000000000002e7a5d";
 
     let mockV1Router: any;
@@ -5244,6 +5559,87 @@ describe("Vault", () => {
 
       expect(vaultQuoteAfter.sub(vaultQuoteBefore)).to.equal(amountOutMin);
     });
+
+    it("WHBAR intermediate hop rebalance succeeds", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(100);     // token0 in
+      const amountOutMin = ONE.mul(50);  // token1 out
+
+      // token0 -> WHBAR -> token1
+      const path = [token0.address, WHBAR, token1.address];
+
+      await token1.transfer(SAUCER_V1_ROUTER, amountOutMin);
+
+      const vaultBaseBefore = await token0.balanceOf(vault.address);
+      const vaultQuoteBefore = await token1.balanceOf(vault.address);
+
+      await expect(
+        vault.connect(deployer).managerRebalanceSaucerV1(
+          true, // BASE -> QUOTE
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          path
+        )
+      )
+        .to.emit(vault, "ManagerRebalance")
+        .withArgs(
+          1,
+          true,
+          token0.address,
+          token1.address,
+          amountIn,
+          amountOutMin,
+          amountOutMin
+        );
+
+      const vaultBaseAfter = await token0.balanceOf(vault.address);
+      const vaultQuoteAfter = await token1.balanceOf(vault.address);
+
+      expect(vaultBaseBefore.sub(vaultBaseAfter)).to.equal(amountIn);
+      expect(vaultQuoteAfter.sub(vaultQuoteBefore)).to.equal(amountOutMin);
+    });
+
+    it("non-WHBAR intermediate hop reverts", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(10);
+      const amountOutMin = ONE.mul(5);
+
+      // Middle hop is token0 (not WHBAR) -> disallowed.
+      const badPath = [token0.address, token0.address, token1.address];
+
+      await expect(
+        vault.connect(deployer).managerRebalanceSaucerV1(
+          true,
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          badPath
+        )
+      ).to.be.revertedWith("bad hop");
+    });
+
+    it("path longer than one intermediate hop reverts", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(10);
+      const amountOutMin = ONE.mul(5);
+
+      // Four tokens (two intermediate hops) -> disallowed even via WHBAR.
+      const badPath = [token0.address, WHBAR, WHBAR, token1.address];
+
+      await expect(
+        vault.connect(deployer).managerRebalanceSaucerV1(
+          true,
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          badPath
+        )
+      ).to.be.revertedWith("bad path");
+    });
   });
   // ─────────────────────────────────────────────────────────────
   // Manager rebalance: SaucerSwap V2
@@ -5251,7 +5647,7 @@ describe("Vault", () => {
   describe("manager rebalance: SaucerSwap V2", () => {
     const ONE = BigNumber.from(10).pow(8);
 
-    const WHBAR = "0x0000000000000000000000000000000000163b59";
+    const WHBAR = "0x0000000000000000000000000000000000163b5a";
     const SAUCER_V2_ROUTER = "0x00000000000000000000000000000000003c437a";
 
     const FEE = 500; // arbitrary v2 fee tier for encoded mock path
@@ -5657,6 +6053,84 @@ describe("Vault", () => {
       expect(vaultBaseBefore.sub(vaultBaseAfter)).to.equal(amountIn);
       expect(routerBaseAfter.sub(routerBaseBefore)).to.equal(amountIn);
       expect(vaultQuoteAfter.sub(vaultQuoteBefore)).to.equal(amountOutMin);
+    });
+
+    it("WHBAR intermediate hop exactInput succeeds", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(100);     // token0 in
+      const amountOutMin = ONE.mul(50);  // token1 out
+
+      // token0 -> WHBAR -> token1
+      const path = encodeV2Path(
+        [token0.address, WHBAR, token1.address],
+        [FEE, FEE]
+      );
+
+      await token1.transfer(SAUCER_V2_ROUTER, amountOutMin);
+
+      const vaultBaseBefore = await token0.balanceOf(vault.address);
+      const vaultQuoteBefore = await token1.balanceOf(vault.address);
+
+      await vault.connect(deployer).managerRebalanceSaucerV2(
+        true,
+        amountIn,
+        amountOutMin,
+        await futureDeadline(),
+        path
+      );
+
+      const vaultBaseAfter = await token0.balanceOf(vault.address);
+      const vaultQuoteAfter = await token1.balanceOf(vault.address);
+
+      expect(vaultBaseBefore.sub(vaultBaseAfter)).to.equal(amountIn);
+      expect(vaultQuoteAfter.sub(vaultQuoteBefore)).to.equal(amountOutMin);
+    });
+
+    it("non-WHBAR intermediate hop reverts", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(10);
+      const amountOutMin = ONE.mul(5);
+
+      // Middle hop is token0 (not WHBAR) -> disallowed.
+      const badPath = encodeV2Path(
+        [token0.address, token0.address, token1.address],
+        [FEE, FEE]
+      );
+
+      await expect(
+        vault.connect(deployer).managerRebalanceSaucerV2(
+          true,
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          badPath
+        )
+      ).to.be.revertedWith("bad hop");
+    });
+
+    it("path longer than one intermediate hop reverts", async () => {
+      await initializeTokenTokenVault();
+
+      const amountIn = ONE.mul(10);
+      const amountOutMin = ONE.mul(5);
+
+      // Two intermediate hops (89 bytes) -> disallowed even via WHBAR.
+      const badPath = encodeV2Path(
+        [token0.address, WHBAR, WHBAR, token1.address],
+        [FEE, FEE, FEE]
+      );
+
+      await expect(
+        vault.connect(deployer).managerRebalanceSaucerV2(
+          true,
+          amountIn,
+          amountOutMin,
+          await futureDeadline(),
+          badPath
+        )
+      ).to.be.revertedWith("bad path");
     });
   });
 });

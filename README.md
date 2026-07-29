@@ -2,8 +2,6 @@
 
 Solidity smart contracts for the Lambdaplex **oracle-free pro-rata pair vault** system on Hedera EVM.
 
-This vault design is intended for emerging token pairs, such as **PLEX/USDC**, where a reliable on-chain oracle feed may not yet exist.
-
 Unlike the Lambdaplex balanced vault, the pro-rata vault does **not** price BASE in QUOTE terms and does **not** attempt to keep the vault 50/50 by value. Instead, shares represent a proportional claim on the vault’s current inventory of both assets.
 
 Core contracts:
@@ -328,6 +326,23 @@ RewardClaimFailed(rewardToken, user, amount)
 
 and leaves the accrued amount intact for retry.
 
+### Permanently stuck rewards
+
+A reward token can become permanently non-transferable (freeze, KYC gate, pause, blacklist). In that state a user's accrual can be neither paid by `claimRewards` nor cleared, so it would remain stranded in the vault's accounting forever.
+
+The owner can resolve such an accrual:
+
+```solidity
+ownerWriteOffReward(address user, address rewardToken)
+```
+
+This is **pay-if-possible**, so the owner cannot use it to take rewards away from a user:
+
+- The vault first attempts to pay the user. If the token is transferable, the user is simply paid (`RewardClaimed`) — a healthy reward can never be destroyed this way.
+- Only if the transfer reverts (the token genuinely cannot move) is the accrual cleared and `RewardWrittenOff(rewardToken, user, amount)` emitted.
+
+A write-off clears only the vault-side accounting. The underlying tokens remain frozen in the distributor's custody; `remaining` is intentionally not reconciled, which is harmless because a frozen token cannot move and `claimTo` stays bounded by `credited - claimed`.
+
 ---
 
 ## AirdropDistributor
@@ -406,6 +421,48 @@ For HBAR deposits:
 For HBAR withdrawals:
 
 - the vault transfers native HBAR directly to the receiver
+
+---
+
+## Manager rebalance (SaucerSwap)
+
+The manager (or owner) can rebalance the vault's inventory between BASE and QUOTE by executing exact-input swaps on SaucerSwap:
+
+- `managerRebalanceSaucerV1(bool baseToQuote, uint256 amountIn, uint256 amountOutMin, uint256 deadline, address[] path)`
+- `managerRebalanceSaucerV2(bool baseToQuote, uint256 amountIn, uint256 amountOutMin, uint256 deadline, bytes path)`
+
+`baseToQuote` selects the swap direction. If a vault side is native HBAR, its endpoint in the route is the WHBAR token; the SaucerSwap router wraps and unwraps native HBAR for the vault.
+
+```solidity
+address public constant WHBAR_TOKEN =
+    0x0000000000000000000000000000000000163B5a;
+```
+
+### Path restrictions
+
+To bound manager routing, the swap path is constrained to two shapes only:
+
+- a **direct** swap: `tokenIn -> tokenOut`
+- a **single intermediate hop through WHBAR**: `tokenIn -> WHBAR -> tokenOut`
+
+Any other route is rejected:
+
+- The first token must match the input side of the vault and the last token must match the output side (`bad tokenIn` / `bad tokenOut`).
+- A path with an intermediate hop must use `WHBAR_TOKEN` as the intermediate (`bad hop`).
+- Paths with more than one intermediate hop, or with a malformed length, are rejected (`bad path`).
+
+Concretely:
+
+- Saucer V1 (`address[] path`): length must be exactly `2` (direct) or `3` (WHBAR hop).
+- Saucer V2 (`bytes path`, `token|fee|token|...`): length must be exactly `43` bytes (direct) or `66` bytes (WHBAR hop).
+
+### Other guards
+
+- Swaps are disabled in emergency mode and before initialization.
+- `deadline` must not be in the past; `amountIn > 0` and `amountOutMin > 0` are required.
+- The vault verifies that exactly `amountIn` of the input side was spent and that the realized output is at least `amountOutMin`.
+
+This narrows, but does not eliminate, the manager's market-making discretion: routing is confined to direct or WHBAR-intermediated pools, but the vault remains oracle-free with no per-transaction or per-epoch size cap. See [Market-making risk remains](#market-making-risk-remains).
 
 ---
 
@@ -499,6 +556,7 @@ Sensitive functions include:
 - Owner fee shares do not receive rewards.
 - Users who join mid-stream are checkpointed so they cannot earn past rewards.
 - Users who exit to zero shares and re-enter later are checkpointed to prevent reward stealing.
+- `ownerWriteOffReward` is pay-if-possible: it pays the user when the token is transferable and only clears the accrual when the transfer reverts, so the owner cannot use it to take away a claimable reward (see [Permanently stuck rewards](#permanently-stuck-rewards)).
 
 ### Management fees
 
@@ -512,6 +570,12 @@ Sensitive functions include:
 - Emergency mode is one-way.
 - Emergency withdrawals ignore lockup.
 - Emergency withdrawals use strict raw pro-rata accounting.
+
+### Manager rebalance
+
+- Only the manager or owner can rebalance; swaps are disabled in emergency mode.
+- Swap routes are restricted to a direct hop or a single WHBAR intermediate hop (see [Manager rebalance (SaucerSwap)](#manager-rebalance-saucerswap)).
+- The vault is oracle-free with no per-transaction or per-epoch size cap, so a compromised manager key remains a centralization risk.
 
 ---
 

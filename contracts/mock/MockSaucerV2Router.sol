@@ -20,7 +20,7 @@ interface IERC20Like {
 ///      - supports token->token, HBAR->token, token->HBAR via multicall + unwrapWHBAR
 contract MockSaucerV2Router {
     address public constant WHBAR =
-        0x0000000000000000000000000000000000163B59;
+        0x0000000000000000000000000000000000163B5a;
 
     struct ExactInputParams {
         bytes path;
