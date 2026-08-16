@@ -20,8 +20,8 @@ Core contracts:
 
 A pro-rata vault holds two assets:
 
-- **BASE**: ERC-20 or native HBAR (`address(0)`)
-- **QUOTE**: ERC-20 or native HBAR (`address(0)`)
+- **BASE**: HTS or native HBAR (`address(0)`)
+- **QUOTE**: HTS or native HBAR (`address(0)`)
 
 Users receive **shares** representing a pro-rata claim on the vault’s current token inventory.
 
@@ -524,7 +524,7 @@ This is a non-exhaustive checklist for auditors and reviewers.
 
 ### Token behavior
 
-- ERC-20 tokens are expected to behave normally.
+- HTS tokens are expected to behave normally.
 - Fee-on-transfer tokens are rejected in deposit paths using balance-delta checks.
 - Native HBAR is supported through `address(0)`.
 
